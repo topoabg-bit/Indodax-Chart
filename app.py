@@ -164,5 +164,7 @@ def show_dashboard(sym, tf):
 
     except Exception as e:
         st.error(f"Tunggu sebentar.. (Mengambil data): {e}")
-
+    # Tampilkan Data Tabel (Opsional)
+    with st.expander("Lihat Data Mentah"):
+        st.dataframe(df.sort_values(by='timestamp', ascending=False))
 show_dashboard(symbol, timeframe)
