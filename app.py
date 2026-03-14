@@ -40,87 +40,73 @@ def show_dashboard(sym, tf):
     try:
         df, ticker = get_market_data(sym, tf)
         
-        # Data Realtime
-        curr = float(ticker['last']) 
-        high = float(ticker['high']) 
-        low = float(ticker['low']) 
-        vol = float(ticker['baseVolume']) 
+        # 1. Pastikan Data Angka (Float)
+        curr = float(ticker['last'])
+        high = float(ticker['high'])
+        low = float(ticker['low'])
+        vol = float(ticker['baseVolume'])
         
+        # 2. Format ke Rupiah (Titik sebagai pemisah ribuan)
+        # Fungsi helper sederhana untuk format angka
+        def format_idr(angka):
+            return f"{angka:,.0f}".replace(",", ".")
+
+        txt_curr = format_idr(curr)
+        txt_high = format_idr(high)
+        txt_low = format_idr(low)
+        # Volume biasanya tidak pakai Rp dan titik jika kecil, tapi kita buat rapi
+        txt_vol = f"{vol:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
         # --- LOGIKA SINYAL ---
         ema_fast = df['EMA_9'].iloc[-1]
         ema_slow = df['EMA_21'].iloc[-1]
         
-        # Tentukan Sinyal
         if ema_fast > ema_slow:
-            signal_text = "STRONG BUY"
-            signal_color = "#00ff00" # Hijau Neon
-            signal_bg = "rgba(0, 255, 0, 0.1)"
+            signal_text, signal_color, signal_bg = "STRONG BUY", "#00ff00", "rgba(0, 255, 0, 0.1)"
         else:
-            signal_text = "STRONG SELL"
-            signal_color = "#ff0000" # Merah Neon
-            signal_bg = "rgba(255, 0, 0, 0.1)"
-            
-        # Hitung Persentase Selisih EMA (Kekuatan Tren)
+            signal_text, signal_color, signal_bg = "STRONG SELL", "#ff0000", "rgba(255, 0, 0, 0.1)"
+
         trend_strength = abs(ema_fast - ema_slow) / ema_slow * 100
 
-        # --- TAMPILAN HTML (Updated) ---
+        # --- TAMPILAN HTML UPDATED (4 KOTAK) ---
         html_stats = f"""
         <style>
-            .stat-container {{
-                display: flex;
-                flex-wrap: wrap;
-                gap: 5px;
-                margin-bottom: 10px;
-            }}
-            .stat-box {{
-                flex: 1;
-                background-color: #262730;
-                padding: 8px;
-                border-radius: 5px;
-                text-align: center;
-                min-width: 70px;
-            }}
-            .signal-box {{
-                flex: 1;
-                background-color: {signal_bg};
-                border: 1px solid {signal_color};
-                padding: 8px;
-                border-radius: 5px;
-                text-align: center;
-                min-width: 100px;
-            }}
-            .label {{ font-size: 10px; color: #bbb; margin-bottom: 2px; }}
-            .value {{ font-size: 12px; font-weight: bold; color: white; }}
-            .signal-text {{ 
-                font-size: 14px; 
-                font-weight: 900; 
-                color: {signal_color}; 
-                letter-spacing: 1px;
-            }}
+            .stat-container {{ display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 15px; }}
+            .stat-box {{ flex: 1; background-color: #1e1e1e; padding: 10px; border-radius: 8px; text-align: center; min-width: 120px; border: 1px solid #333; }}
+            .signal-box {{ flex: 1.2; background-color: {signal_bg}; border: 1px solid {signal_color}; padding: 10px; border-radius: 8px; text-align: center; min-width: 150px; }}
+            .label {{ font-size: 10px; color: #999; text-transform: uppercase; margin-bottom: 4px; font-weight: bold; }}
+            .value {{ font-size: 14px; font-weight: bold; color: #ffffff; }}
+            .signal-text {{ font-size: 16px; font-weight: 900; color: {signal_color}; }}
         </style>
-
+        
         <div class="stat-container">
-            <!-- Kotak Sinyal Paling Kiri -->
+            <!-- Sinyal -->
             <div class="signal-box">
                 <div class="label">REKOMENDASI</div>
                 <div class="signal-text">{signal_text}</div>
-                <div class="label" style="font-size: 8px;">Kekuatan: {trend_strength:.2f}%</div>
+                <div style="font-size: 9px; color: {signal_color}; opacity: 0.8;">Power: {trend_strength:.2f}%</div>
             </div>
             
-            <!-- Kotak Harga -->
+            <!-- Harga Terakhir -->
             <div class="stat-box">
-                <div class="label">HARGA</div>
-                <div class="value">Rp {curr:,.0f}</div>
+                <div class="label">HARGA SAAT INI</div>
+                <div class="value" style="color: #f1c40f;">Rp {txt_curr}</div>
             </div>
-            
-            <!-- Kotak Volume -->
+
+            <!-- Tertinggi & Terendah -->
             <div class="stat-box">
-                <div class="label">VOL (24J)</div>
-                <div class="value">{vol:,.0f}</div>
+                <div class="label">24H HIGH / LOW</div>
+                <div class="value" style="font-size: 12px; color: #2ecc71;">↑ {txt_high}</div>
+                <div class="value" style="font-size: 12px; color: #e74c3c;">↓ {txt_low}</div>
+            </div>
+
+            <!-- Volume -->
+            <div class="stat-box">
+                <div class="label">VOLUME (24H)</div>
+                <div class="value">{txt_vol}</div>
             </div>
         </div>
         """
-        
         st.markdown(html_stats, unsafe_allow_html=True)
 
         # --- CHART + INDIKATOR ---
