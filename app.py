@@ -1,254 +1,253 @@
 import streamlit as st
 import ccxt
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime
 import pytz
 
-# --- 1. KONFIGURASI HALAMAN ---
-st.set_page_config(layout="wide", page_title="Hybrid SMC + EMA Pro")
+# --- 1. KONFIGURASI ---
+st.set_page_config(layout="wide", page_title="SMC Liquidity Hunter")
 
-# --- 2. ENGINE DATA & SINYAL ---
-def get_market_data(symbol, timeframe):
+# --- 2. SMC ENGINE (LOGIC INTI) ---
+def calculate_smc_logic(df):
+    # A. Indikator Dasar
+    # RSI (14)
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    
+    # ATR (14) untuk Stop Loss Dinamis
+    df['tr0'] = abs(df['high'] - df['low'])
+    df['tr1'] = abs(df['high'] - df['close'].shift())
+    df['tr2'] = abs(df['low'] - df['close'].shift())
+    df['TR'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+    df['ATR'] = df['TR'].ewm(span=14, adjust=False).mean()
+
+    # B. Identifikasi Swing High/Low (Fractals 5 Candle)
+    # Swing Low: Candle tengah lebih rendah dari 2 kiri dan 2 kanan
+    df['is_swing_low'] = (
+        (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(2)) &
+        (df['low'] < df['low'].shift(-1)) & (df['low'] < df['low'].shift(-2))
+    )
+    # Swing High
+    df['is_swing_high'] = (
+        (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(2)) &
+        (df['high'] > df['high'].shift(-1)) & (df['high'] > df['high'].shift(-2))
+    )
+    
+    # Propagasi nilai Swing terakhir ke baris berikutnya (Forward fill) untuk referensi likuiditas
+    df['prev_swing_low'] = df['low'].where(df['is_swing_low']).ffill().shift(1)
+    df['prev_swing_high'] = df['high'].where(df['is_swing_high']).ffill().shift(1)
+
+    # C. Deteksi FVG (Fair Value Gap)
+    # Bullish FVG: Gap antara High Candle-1 dan Low Candle-3
+    df['fvg_bull_top'] = df['low'].shift(-1) # Candle masa depan (karena shift logic) - disesuaikan logic array
+    df['fvg_bull_bot'] = df['high'].shift(1)
+    df['is_fvg_bull'] = (df['low'] > df['high'].shift(2)) & (df['close'] > df['open']) # Logic Simplified: Gap Exist
+    
+    # Bearish FVG
+    df['is_fvg_bear'] = (df['high'] < df['low'].shift(2)) & (df['close'] < df['open'])
+
+    # --- D. LOGIKA SINYAL (SCANNING) ---
+    df['signal_action'] = "WAIT"
+    df['signal_reason'] = ""
+    
+    # Iterasi manual untuk logika sequence (Sweep -> FVG -> Entry)
+    # Kita hanya cek 10 candle terakhir untuk efisiensi real-time
+    last_idx = df.index[-1]
+    
+    current_rsi = df['RSI'].iloc[-1]
+    current_price = df['close'].iloc[-1]
+    atr = df['ATR'].iloc[-1]
+    
+    # Setup Variables
+    signal = "WAIT"
+    entry = 0
+    stop_loss = 0
+    tp1 = 0
+    tp2 = 0
+    
+    # 1. SETUP BUY (SMC)
+    # Syarat: RSI baru keluar dari Oversold (<35) + Harga menyentuh area FVG Bullish terakhir
+    
+    # Cari FVG Bullish terdekat yang valid
+    last_fvg_bull_idx = df[df['is_fvg_bull']].index[-1] if df['is_fvg_bull'].any() else None
+    
+    if last_fvg_bull_idx:
+        fvg_top = df.loc[last_fvg_bull_idx, 'low'] # Low candle ke-3 (Current candle di logic FVG)
+        fvg_bot = df.loc[last_fvg_bull_idx, 'high'].shift(2) # High candle ke-1
+        
+        # Cek apakah harga sekarang sedang retest FVG ini?
+        # Dan RSI Bullish (Baru naik dari 30)
+        if (df['low'].iloc[-1] <= fvg_top) and (current_rsi < 45) and (current_rsi > 25):
+            signal = "SMC BUY"
+            entry = current_price
+            
+            # SL: Swing Low Terakhir - (1.5 x ATR)
+            last_sw_low = df['prev_swing_low'].iloc[-1]
+            stop_loss = last_sw_low - (1.5 * atr)
+            
+            # TP Calculation
+            risk = entry - stop_loss
+            tp1 = entry + (risk * 1.5) # Rasio 1:1.5
+            tp2 = df['prev_swing_high'].iloc[-1] # Target Likuiditas (High sebelumnya)
+
+    # 2. SETUP SELL (SMC)
+    # Cari FVG Bearish
+    last_fvg_bear_idx = df[df['is_fvg_bear']].index[-1] if df['is_fvg_bear'].any() else None
+    
+    if last_fvg_bear_idx:
+        fvg_bot = df.loc[last_fvg_bear_idx, 'high'] 
+        
+        # Cek Retest + RSI Overbought
+        if (df['high'].iloc[-1] >= fvg_bot) and (current_rsi > 55) and (current_rsi < 75):
+            signal = "SMC SELL"
+            entry = current_price
+            
+            last_sw_high = df['prev_swing_high'].iloc[-1]
+            stop_loss = last_sw_high + (1.5 * atr)
+            
+            risk = stop_loss - entry
+            tp1 = entry - (risk * 1.5)
+            tp2 = df['prev_swing_low'].iloc[-1]
+
+    return df, signal, entry, stop_loss, tp1, tp2
+
+def get_data(symbol, timeframe):
     exchange = ccxt.indodax()
     ticker = exchange.fetch_ticker(symbol)
-    
-    # Ambil Data Candle
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=300)
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    
-    # Konversi Waktu ke WIB
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Jakarta')
-    
-    # --- INDIKATOR ---
-    # 1. EMA Cepat & Lambat (Untuk Sinyal Harian)
-    df['EMA_9'] = df['close'].ewm(span=9, adjust=False).mean()
-    df['EMA_21'] = df['close'].ewm(span=21, adjust=False).mean()
-    
-    # 2. EMA Tren Besar (Filter)
-    df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
-    
-    # 3. MACD (Momentum)
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = ema12 - ema26
-    df['MACD_SIGNAL'] = df['MACD'].ewm(span=9, adjust=False).mean()
-    
-    # 4. Bollinger Bands
-    df['BB_UPPER'] = df['close'].rolling(20).mean() + (df['close'].rolling(20).std() * 2)
-    df['BB_LOWER'] = df['close'].rolling(20).mean() - (df['close'].rolling(20).std() * 2)
-    
-    # 5. Struktur Market (Untuk SL Otomatis)
-    df['SWING_LOW'] = df['low'].rolling(window=5).min()
-    df['SWING_HIGH'] = df['high'].rolling(window=5).max()
-
-    # --- POLA CANDLE (SMC) ---
-    df['BULL_ENGULF'] = (df['close'] > df['open']) & (df['close'] > df['open'].shift(1)) & (df['open'] < df['close'].shift(1))
-    df['BEAR_ENGULF'] = (df['close'] < df['open']) & (df['close'] < df['open'].shift(1)) & (df['open'] > df['close'].shift(1))
-
-    # --- LOGIKA SCORING SINYAL (HIERARKI) ---
-    df['signal_type'] = "NEUTRAL"
-    df['signal_source'] = ""
-    
-    # A. SINYAL EMA CROSS (Tier 2 - Sering Muncul)
-    # Cross Up (Golden Cross Kecil)
-    cond_ema_buy = (df['EMA_9'] > df['EMA_21']) & (df['EMA_9'].shift(1) <= df['EMA_21'].shift(1))
-    # Cross Down (Death Cross Kecil)
-    cond_ema_sell = (df['EMA_9'] < df['EMA_21']) & (df['EMA_9'].shift(1) >= df['EMA_21'].shift(1))
-    
-    df.loc[cond_ema_buy, 'signal_type'] = "TREND BUY"
-    df.loc[cond_ema_buy, 'signal_source'] = "EMA CROSS"
-    
-    df.loc[cond_ema_sell, 'signal_type'] = "TREND SELL"
-    df.loc[cond_ema_sell, 'signal_source'] = "EMA CROSS"
-    
-    # B. SINYAL SMC (Tier 1 - Prioritas Tinggi / Menimpa EMA)
-    # Validasi: Harus searah dengan EMA 200
-    cond_smc_buy = (df['BULL_ENGULF']) & (df['close'] > df['EMA_200']) & (df['MACD'] > df['MACD_SIGNAL'])
-    cond_smc_sell = (df['BEAR_ENGULF']) & (df['close'] < df['EMA_200']) & (df['MACD'] < df['MACD_SIGNAL'])
-    
-    df.loc[cond_smc_buy, 'signal_type'] = "STRONG BUY"
-    df.loc[cond_smc_buy, 'signal_source'] = "SMC ACTION"
-    
-    df.loc[cond_smc_sell, 'signal_type'] = "STRONG SELL"
-    df.loc[cond_smc_sell, 'signal_source'] = "SMC ACTION"
-
     return df, ticker
 
-# --- 3. DASHBOARD LOGIC ---
-st.sidebar.header("⚙️ Hybrid Trading")
-symbol = st.sidebar.selectbox("Aset", ['BTC/IDR', 'ETH/IDR', 'DOGE/IDR', 'SOL/IDR', 'XRP/IDR', 'SHIB/IDR', 'PEPE/IDR'])
+# --- 3. DASHBOARD UI ---
+st.sidebar.header("🛠️ SMC Setup")
+symbol = st.sidebar.selectbox("Market", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR', 'PEPE/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['15m', '1h', '4h', '1d'])
 
-st.title(f"Hybrid Trader: {symbol}")
+st.title(f"🦅 SMC Liquidity Hunter: {symbol}")
 
 @st.fragment(run_every=60)
-def show_dashboard(sym, tf):
+def main_dashboard(sym, tf):
     try:
-        df, ticker = get_market_data(sym, tf)
+        # Fetch & Calculate
+        df_raw, ticker = get_data(sym, tf)
+        df, signal, entry, sl, tp1, tp2 = calculate_smc_logic(df_raw)
         
+        # Data Realtime
         curr = float(ticker['last'])
-        high_24 = float(ticker['high'])
-        low_24 = float(ticker['low'])
         vol = float(ticker['baseVolume'])
+        rsi_now = df['RSI'].iloc[-1]
         
-        # --- DETEKSI SINYAL ---
-        # Cek 5 candle terakhir agar sinyal tidak hilang terlalu cepat
-        scan_window = df.tail(5)
+        # Styling Logic
+        sig_color = "#888"
+        sig_bg = "#1e1e1e"
         
-        # Default State
-        active_signal = "WAIT / HOLD"
-        source_label = "NO SIGNAL"
-        sig_bg = "#262730"
-        sig_col = "#777"
-        
-        # Variabel Plan
-        plan_entry = 0
-        plan_tp = 0
-        plan_sl = 0
-        
-        # Loop cari sinyal (Prioritaskan yang paling baru)
-        for i, row in scan_window.iterrows():
-            if row['signal_type'] != "NEUTRAL":
-                active_signal = row['signal_type']
-                source_label = row['signal_source']
-                plan_entry = row['close']
-                
-                # Logika SL & TP Dinamis
-                if "BUY" in active_signal:
-                    sig_col = "#00e676" # Hijau
-                    sig_bg = "rgba(0, 255, 0, 0.1)"
-                    
-                    # SL = Swing Low Terakhir (SMC) atau 2% dibawah harga (EMA)
-                    sl_candidate = row['SWING_LOW']
-                    if sl_candidate >= plan_entry: # Safety check jika swing low aneh
-                         sl_candidate = plan_entry * 0.98
-                    
-                    plan_sl = sl_candidate
-                    risk = plan_entry - plan_sl
-                    plan_tp = plan_entry + (risk * 2) # RR 1:2
-                    
-                elif "SELL" in active_signal:
-                    sig_col = "#ff1744" # Merah
-                    sig_bg = "rgba(255, 0, 0, 0.1)"
-                    
-                    sl_candidate = row['SWING_HIGH']
-                    if sl_candidate <= plan_entry:
-                        sl_candidate = plan_entry * 1.02
-                        
-                    plan_sl = sl_candidate
-                    risk = plan_sl - plan_entry
-                    plan_tp = plan_entry - (risk * 2)
-
-        # Format String
+        if "BUY" in signal:
+            sig_color = "#00e676"
+            sig_bg = "rgba(0, 255, 0, 0.15)"
+        elif "SELL" in signal:
+            sig_color = "#ff1744"
+            sig_bg = "rgba(255, 0, 0, 0.15)"
+            
+        # Helper Format
         def fmt(x): return f"{x:,.0f}".replace(",", ".")
-        
-        f_curr = fmt(curr)
-        f_tp = fmt(plan_tp) if plan_tp > 0 else "-"
-        f_sl = fmt(plan_sl) if plan_sl > 0 else "-"
-        f_entry = fmt(plan_entry) if plan_entry > 0 else "-"
-        
-        # Confluence Check (Lampu Indikator)
-        last = df.iloc[-1]
-        is_ema_uptrend = last['EMA_9'] > last['EMA_21']
-        is_big_trend = last['close'] > last['EMA_200']
-        
-        c_ema = "#00e676" if is_ema_uptrend else "#ff1744"
-        c_big = "#00e676" if is_big_trend else "#ff1744"
-        c_mom = "#00e676" if last['MACD'] > last['MACD_SIGNAL'] else "#ff1744"
+        def fmt_dec(x): return f"{x:,.2f}".replace(".", ",")
 
-        # --- CSS ISOLATED ---
-        st.markdown("""
-        <style>
-            .grid-market { display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }
-            .grid-plan { display: grid; grid-template-columns: 1fr 1fr 1fr 1.5fr; gap: 8px; margin-bottom: 20px; }
-            .box { background: #1e1e1e; border: 1px solid #333; padding: 10px; border-radius: 6px; text-align: center; }
-            .sig-box { padding: 10px; border-radius: 6px; text-align: center; display: flex; flex-direction: column; justify-content: center; }
-            
-            .lbl { font-size: 9px; color: #bbb; font-weight: bold; margin-bottom: 4px; }
-            .val { font-size: 14px; font-weight: bold; color: white; }
-            .val-lg { font-size: 16px; font-weight: 900; }
-            
-            .conf-row { display: flex; justify-content: space-between; font-size: 10px; margin-top: 4px; padding-bottom: 4px; border-bottom: 1px solid #333; }
-        </style>
-        """, unsafe_allow_html=True)
-
-        # --- HTML UI ---
+        # --- HTML COMPONENT ---
         st.markdown(f"""
-        <div class="grid-market">
-            <div class="sig-box" style="background: {sig_bg}; border: 2px solid {sig_col};">
-                <div class="lbl">{source_label}</div>
-                <div class="val-lg" style="color: {sig_col};">{active_signal}</div>
+        <style>
+            .grid-container {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 15px; }}
+            .plan-container {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 10px; margin-bottom: 20px; }}
+            .card {{ background: #1e1e1e; padding: 12px; border-radius: 8px; border: 1px solid #333; text-align: center; }}
+            .card-sig {{ background: {sig_bg}; padding: 12px; border-radius: 8px; border: 2px solid {sig_color}; text-align: center; }}
+            
+            .lbl {{ font-size: 10px; color: #aaa; text-transform: uppercase; font-weight: bold; letter-spacing: 0.5px; }}
+            .val {{ font-size: 16px; color: white; font-weight: bold; }}
+            .val-lg {{ font-size: 18px; color: {sig_color}; font-weight: 900; }}
+            
+            .badge {{ font-size: 10px; padding: 2px 6px; border-radius: 4px; background: #333; color: #fff; }}
+        </style>
+        
+        <!-- ROW 1: MARKET STATUS -->
+        <div class="grid-container">
+            <div class="card-sig">
+                <div class="lbl">STATUS SINYAL</div>
+                <div class="val-lg">{signal}</div>
             </div>
-            <div class="box">
-                <div class="lbl">HARGA</div>
-                <div class="val" style="color: #f1c40f;">Rp {f_curr}</div>
+            <div class="card">
+                <div class="lbl">HARGA SAAT INI</div>
+                <div class="val" style="color:#f1c40f;">Rp {fmt(curr)}</div>
             </div>
-            <div class="box"><div class="lbl">VOL 24J</div><div class="val">{vol:,.0f}</div></div>
-            <div class="box"><div class="lbl">LOW</div><div class="val" style="color: #ff1744;">{fmt(low_24)}</div></div>
-            <div class="box"><div class="lbl">HIGH</div><div class="val" style="color: #00e676;">{fmt(high_24)}</div></div>
+             <div class="card">
+                <div class="lbl">RSI (14)</div>
+                <div class="val">{fmt_dec(rsi_now)}</div>
+            </div>
+            <div class="card">
+                <div class="lbl">VOL (24J)</div>
+                <div class="val">{fmt(vol)}</div>
+            </div>
         </div>
         
-        <div class="grid-plan">
-            <div class="box" style="border-top: 3px solid #f1c40f;">
-                <div class="lbl">ENTRY PLAN</div>
-                <div class="val" style="color: #f1c40f;">{f_entry}</div>
+        <!-- ROW 2: TRADING PLAN (Hanya Muncul jika ada Sinyal) -->
+        <div class="plan-container">
+            <div class="card" style="border-top: 3px solid #f1c40f;">
+                <div class="lbl">ENTRY (FVG REACTION)</div>
+                <div class="val" style="color:#f1c40f;">{fmt(entry) if entry > 0 else "-"}</div>
             </div>
-            <div class="box" style="border-top: 3px solid #00e676;">
-                <div class="lbl">TAKE PROFIT</div>
-                <div class="val" style="color: #00e676;">{f_tp}</div>
+            <div class="card" style="border-top: 3px solid #ff1744;">
+                <div class="lbl">STOP LOSS (1.5x ATR)</div>
+                <div class="val" style="color:#ff1744;">{fmt(sl) if sl > 0 else "-"}</div>
             </div>
-            <div class="box" style="border-top: 3px solid #ff1744;">
-                <div class="lbl">STOP LOSS</div>
-                <div class="val" style="color: #ff1744;">{f_sl}</div>
+             <div class="card" style="border-top: 3px solid #00e676;">
+                <div class="lbl">TP 1 (RASIO 1:1.5)</div>
+                <div class="val" style="color:#00e676;">{fmt(tp1) if tp1 > 0 else "-"}</div>
             </div>
-            <div class="box" style="text-align: left; padding: 8px 15px;">
-                <div class="lbl" style="text-align: center;">MARKET CONFLUENCE</div>
-                <div class="conf-row">
-                    <span style="color:#ccc">EMA CROSS (9/21)</span>
-                    <span style="color:{c_ema}; font-weight:bold;">{'BULLISH' if is_ema_uptrend else 'BEARISH'}</span>
-                </div>
-                <div class="conf-row">
-                    <span style="color:#ccc">BIG TREND (200)</span>
-                    <span style="color:{c_big}; font-weight:bold;">{'UPTREND' if is_big_trend else 'DOWNTREND'}</span>
-                </div>
-                 <div class="conf-row" style="border:none;">
-                    <span style="color:#ccc">MOMENTUM</span>
-                    <span style="color:{c_mom}; font-weight:bold;">{'STRONG' if last['MACD'] > last['MACD_SIGNAL'] else 'WEAK'}</span>
-                </div>
+            <div class="card" style="border-top: 3px solid #00b0ff;">
+                <div class="lbl">TP 2 (LIQUIDITY)</div>
+                <div class="val" style="color:#00b0ff;">{fmt(tp2) if tp2 > 0 else "-"}</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
+        
+        # --- VISUALISASI CHART SMC ---
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
+        
+        # 1. Candlestick
+        fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
+        
+        # 2. Swing High/Low Markers (Liquidity Points)
+        sw_lows = df[df['is_swing_low']]
+        sw_highs = df[df['is_swing_high']]
+        
+        fig.add_trace(go.Scatter(x=sw_lows['timestamp'], y=sw_lows['low'], mode='markers', marker=dict(symbol='triangle-up', color='yellow', size=6), name='Swing Low (Liq)'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=sw_highs['timestamp'], y=sw_highs['high'], mode='markers', marker=dict(symbol='triangle-down', color='orange', size=6), name='Swing High (Liq)'), row=1, col=1)
 
-        # --- CHART ---
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+        # 3. FVG Visualization (Rectangle Zones)
+        # Menggambar 5 FVG terakhir agar chart tidak kotor
+        bullish_fvgs = df[df['is_fvg_bull']].tail(5)
+        bearish_fvgs = df[df['is_fvg_bear']].tail(5)
         
-        # 1. Harga & EMA
-        fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Harga'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_9'], line=dict(color='#2979ff', width=1.5), name='EMA 9 (Fast)'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_21'], line=dict(color='#ff9100', width=1.5), name='EMA 21 (Slow)'), row=1, col=1)
-        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_200'], line=dict(color='white', width=1, dash='dot'), name='EMA 200'), row=1, col=1)
+        # Logic menggambar kotak FVG membutuhkan trik shape di Plotly
+        # Kita pakai Scatter baris putus-putus untuk menandai zona FVG
+        if not bullish_fvgs.empty:
+             fig.add_trace(go.Scatter(x=bullish_fvgs['timestamp'], y=bullish_fvgs['low'], mode='markers', marker=dict(symbol='line-ns', color='rgba(0,255,0,0.5)', line_width=2, size=20), name='Bullish FVG Zone'), row=1, col=1)
         
-        # 2. Marker Sinyal
-        # Marker EMA Cross
-        ema_crosses = df[df['signal_source'] == "EMA CROSS"]
-        if not ema_crosses.empty:
-             fig.add_trace(go.Scatter(x=ema_crosses['timestamp'], y=ema_crosses['close'], mode='markers', marker=dict(symbol='circle-open', size=8, color='yellow'), name='EMA Cross'), row=1, col=1)
-        
-        # Marker SMC
-        smc_sigs = df[df['signal_source'] == "SMC ACTION"]
-        if not smc_sigs.empty:
-             fig.add_trace(go.Scatter(x=smc_sigs['timestamp'], y=smc_sigs['high'], mode='markers', marker=dict(symbol='diamond', size=12, color='#d500f9'), name='SMC Signal'), row=1, col=1)
+        # 4. RSI Confirmation
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['RSI'], line=dict(color='#a4a4a4', width=1.5), name='RSI'), row=2, col=1)
+        # Garis Batas 30 dan 70
+        fig.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+        fig.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
 
-        # 3. MACD
-        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], line=dict(color='#00e676'), name='MACD'), row=2, col=1)
-        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD_SIGNAL'], line=dict(color='#ff1744'), name='Signal'), row=2, col=1)
-        
-        fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=0,t=30,b=0), xaxis_rangeslider_visible=False)
+        fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=0,t=30,b=0), xaxis_rangeslider_visible=False, title="SMC Structure Analysis")
         st.plotly_chart(fig, use_container_width=True)
-
+        
     except Exception as e:
-        st.error(f"Menunggu data... {e}")
+        st.error(f"Sedang memindai struktur pasar... ({e})")
 
-show_dashboard(symbol, timeframe)
+main_dashboard(symbol, timeframe)
