@@ -4,6 +4,7 @@ import pandas as pd
 import plotly.graph_objects as go
 from datetime import datetime
 import pytz
+import textwrap
 
 # 1. Konfigurasi Halaman
 st.set_page_config(layout="wide", page_title="Indodax Pro + Sinyal")
@@ -64,7 +65,7 @@ def show_dashboard(sym, tf):
         trend_strength = abs(ema_fast - ema_slow) / ema_slow * 100
 
         # --- TAMPILAN HTML (Updated) ---
-        html_stats = f"""
+        html_stats = text wrap.dedent(f"""
         <style>
             .stat-container {{
                 display: flex;
