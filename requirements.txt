@@ -3,4 +3,3 @@ ccxt
 pandas
 plotly
 pytz
-textwrap
