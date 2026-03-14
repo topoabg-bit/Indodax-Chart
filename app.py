@@ -41,10 +41,10 @@ def show_dashboard(sym, tf):
         df, ticker = get_market_data(sym, tf)
         
         # Data Realtime
-        curr = ticker['last']
-        high = ticker['high']
-        low = ticker['low']
-        vol = ticker['baseVolume']
+        curr = float(ticker['last']) 
+        high = float(ticker['high']) 
+        low = float(ticker['low']) 
+        vol = float(ticker['baseVolume']) 
         
         # --- LOGIKA SINYAL ---
         ema_fast = df['EMA_9'].iloc[-1]
