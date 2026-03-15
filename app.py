@@ -4,257 +4,196 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
+from datetime import datetime
 import pytz
 
-# --- 1. SETUP HALAMAN ---
-st.set_page_config(layout="wide", page_title="RA Trading Logic: Structure & Sweep")
+# --- 1. KONFIGURASI UTAMA ---
+st.set_page_config(layout="wide", page_title="Indodax Scalper: Trend & Momentum")
 
-# --- 2. ENGINE LOGIKA (RIZKI ADITAMA STYLE) ---
-
-def get_market_structure(df):
-    """
-    Menentukan Struktur Pasar (HH, HL, LH, LL)
-    Menggunakan Fractal 5 candle (2 kiri, 2 kanan)
-    """
-    # Identifikasi Swing High (Fractal Up)
-    df['is_high'] = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(2)) & \
-                    (df['high'] > df['high'].shift(-1)) & (df['high'] > df['high'].shift(-2))
+# --- 2. ENGINE INDIKATOR ---
+def calculate_indicators(df):
+    # A. Trend Filter (EMA 200 & EMA 50)
+    df['EMA_50'] = df['close'].ewm(span=50, adjust=False).mean()
+    df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
     
-    # Identifikasi Swing Low (Fractal Down)
-    df['is_low'] = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(2)) & \
-                   (df['low'] < df['low'].shift(-1)) & (df['low'] < df['low'].shift(-2))
-
-    # Simpan nilai Swing Terakhir (Forward Fill untuk referensi real-time)
-    df['last_high'] = df['high'].where(df['is_high']).ffill()
-    df['last_low'] = df['low'].where(df['is_low']).ffill()
+    # B. Momentum (Stochastic RSI) - Early Signal
+    # Setelan Scalping: 14, 3, 3
+    period = 14
+    smoothK = 3
+    smoothD = 3
+    
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    
+    stoch_rsi = (rsi - rsi.rolling(period).min()) / (rsi.rolling(period).max() - rsi.rolling(period).min())
+    df['K'] = stoch_rsi.rolling(smoothK).mean() * 100
+    df['D'] = df['K'].rolling(smoothD).mean()
+    
+    # C. Volume Flow
+    df['Vol_MA'] = df['volume'].rolling(20).mean()
+    df['Vol_Spike'] = df['volume'] > df['Vol_MA']
+    
+    # D. ATR untuk Stop Loss Dinamis
+    df['tr'] = np.maximum(df['high'] - df['low'], 
+               np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
+    df['ATR'] = df['tr'].ewm(span=14).mean()
     
     return df
 
-def get_htf_bias(symbol, current_tf):
-    """
-    Logika Konfirmasi Multi Time Frame (MTF)
-    Jika TF 15m -> Cek TF 1h. Jika TF 1h -> Cek TF 4h.
-    Bias ditentukan oleh posisi harga terhadap EMA 50 dan Struktur Terakhir.
-    """
-    tf_map = {'15m': '1h', '1h': '4h', '4h': '1d'}
-    htf = tf_map.get(current_tf, '1d')
+def detect_signals(df):
+    df['signal'] = "WAIT"
+    df['entry_price'] = 0.0
     
-    exchange = ccxt.indodax()
-    try:
-        ohlcv = exchange.fetch_ohlcv(symbol, htf, limit=100)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        
-        # Simple Bias: Harga diatas EMA 50 = Bullish, Dibawah = Bearish
-        ema50 = df['close'].ewm(span=50).mean().iloc[-1]
-        curr = df['close'].iloc[-1]
-        
-        return "BULLISH" if curr > ema50 else "BEARISH", htf
-    except:
-        return "NEUTRAL", htf
-
-def detect_sweep_entry(df, htf_bias):
-    """
-    Logika Inti Entry: LIQUIDITY SWEEP + SnD
-    """
+    # Loop scanning candle terakhir (Realtime)
     last_idx = df.index[-1]
-    curr_row = df.iloc[-1]
-    prev_row = df.iloc[-2] # Candle yang baru close (konfirmasi)
+    prev_idx = df.index[-2]
     
-    signal = "WAITING"
-    entry_price = 0
-    sl_price = 0
-    tp_price = 0
-    setup_valid = False
+    # Ambil Data
+    close = df['close'].iloc[-1]
+    ema200 = df['EMA_200'].iloc[-1]
+    k_now = df['K'].iloc[-1]
+    d_now = df['D'].iloc[-1]
+    k_prev = df['K'].iloc[-2]
+    d_prev = df['D'].iloc[-2]
+    vol_ok = df['Vol_Spike'].iloc[-1]
     
-    # Ambil Struktur Swing Terakhir (Likuiditas)
-    # Kita lihat Swing Low/High valid SEBELUM candle saat ini
-    # Shift 3 karena fractal butuh 2 candle kanan untuk confirm, kita cari swing lama
-    recent_swing_low = df['last_low'].iloc[-5] 
-    recent_swing_high = df['last_high'].iloc[-5]
-    
-    if pd.isna(recent_swing_low) or pd.isna(recent_swing_high):
-        return signal, 0, 0, 0, False
+    # --- LOGIKA BUY (SCALPING) ---
+    # 1. Trend: Harga DIATAS EMA 200 (Wajib Uptrend)
+    # 2. Momentum: Stoch RSI Cross UP di area Oversold (< 20) atau area Bullish
+    # 3. Volume: Ada ledakan volume
+    if (close > ema200) and (k_prev < d_prev) and (k_now > d_now) and (k_now < 40) and vol_ok:
+        df.loc[last_idx, 'signal'] = "SCALP BUY"
+        df.loc[last_idx, 'entry_price'] = close
 
-    # --- SKENARIO BUY (BULLISH) ---
-    # Syarat:
-    # 1. HTF Bias harus BULLISH
-    # 2. Harga menusuk Swing Low (Sweep Liquidity)
-    # 3. Tapi Close kembali diatas Swing Low (Reject)
-    # 4. Terbentuk Demand Zone (Candle Merah terakhir sebelum naik)
-    
-    if htf_bias == "BULLISH":
-        # Cek Sweep pada candle sebelumnya (prev_row) atau 2 candle lalu
-        # Low candle < Swing Low TAPI Close candle > Swing Low
-        is_sweep = (prev_row['low'] < recent_swing_low) and (prev_row['close'] > recent_swing_low)
+    # --- LOGIKA SELL (SCALPING) ---
+    # 1. Trend: Harga DIBAWAH EMA 200 (Wajib Downtrend)
+    # 2. Momentum: Stoch RSI Cross DOWN di area Overbought (> 80) atau area Bearish
+    elif (close < ema200) and (k_prev > d_prev) and (k_now < d_now) and (k_now > 60) and vol_ok:
+        df.loc[last_idx, 'signal'] = "SCALP SELL"
+        df.loc[last_idx, 'entry_price'] = close
         
-        if is_sweep:
-            signal = "BUY (LIQUIDITY SWEEP)"
-            setup_valid = True
-            
-            # ENTRY: Di area Body candle sweep (Demand Zone)
-            # Atau agresif di Open candle baru
-            entry_price = prev_row['close'] 
-            
-            # SL: Di bawah ekor sweep (titik terendah manipulasi)
-            sl_price = prev_row['low'] 
-            
-            # TP: RR 1:2
-            risk = entry_price - sl_price
-            tp_price = entry_price + (risk * 2)
-
-    # --- SKENARIO SELL (BEARISH) ---
-    elif htf_bias == "BEARISH":
-        # High candle > Swing High TAPI Close candle < Swing High
-        is_sweep = (prev_row['high'] > recent_swing_high) and (prev_row['close'] < recent_swing_high)
-        
-        if is_sweep:
-            signal = "SELL (LIQUIDITY SWEEP)"
-            setup_valid = True
-            
-            entry_price = prev_row['close']
-            sl_price = prev_row['high'] # Di atas ekor sweep
-            
-            risk = sl_price - entry_price
-            tp_price = entry_price - (risk * 2)
-            
-    return signal, entry_price, sl_price, tp_price, setup_valid
+    return df
 
 def get_data(symbol, tf):
     exchange = ccxt.indodax()
-    ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=200)
+    # Ambil 300 candle untuk EMA 200 yang akurat
+    ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=300)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Jakarta')
-    ticker = exchange.fetch_ticker(symbol)
-    return df, ticker
+    return df, exchange.fetch_ticker(symbol)
 
-# --- 3. DASHBOARD VISUAL ---
-st.sidebar.header("Strategy: Rizki Aditama")
-symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR'])
-timeframe = st.sidebar.selectbox("Timeframe", ['15m', '1h', '4h'])
+# --- 3. VISUALISASI DASHBOARD ---
+st.sidebar.header("🚀 Scalping Master Settings")
+symbol = st.sidebar.selectbox("Pilih Koin", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR', 'PEPE/IDR'])
+timeframe = st.sidebar.selectbox("Timeframe", ['5m', '15m', '1h'])
 
-st.title(f"🏛️ Market Structure & Sweep: {symbol}")
+st.title(f"Scalping Master: {symbol} ({timeframe})")
 
 @st.fragment(run_every=60)
-def show_dashboard(sym, tf):
+def main_app(sym, tf):
     try:
-        # 1. Fetch & Process
+        # Fetch & Process
         df, ticker = get_data(sym, tf)
-        df = get_market_structure(df)
-        htf_bias, htf_label = get_htf_bias(sym, tf)
+        df = calculate_indicators(df)
+        df = detect_signals(df)
         
-        # 2. Logic Entry
-        sig_text, entry, sl, tp, is_valid = detect_sweep_entry(df, htf_bias)
+        # Variabel Kunci
+        curr_price = float(ticker['last'])
+        last_sig = df['signal'].iloc[-1]
+        atr = df['ATR'].iloc[-1]
+        ema_200 = df['EMA_200'].iloc[-1]
         
-        # 3. Realtime Var
-        curr = float(ticker['last'])
-        vol = float(ticker['baseVolume'])
-        high_24 = float(ticker['high'])
-        low_24 = float(ticker['low'])
+        # Tentukan Tren Utama
+        trend_status = "UPTREND (BULLISH)" if curr_price > ema_200 else "DOWNTREND (BEARISH)"
+        trend_color = "#00e676" if curr_price > ema_200 else "#ff1744"
         
-        # Warna
-        sig_col = "#777"
+        # Warna Sinyal
         sig_bg = "#1e1e1e"
-        if "BUY" in sig_text:
-            sig_col = "#00e676"
+        sig_col = "#aaa"
+        entry_display = "-"
+        sl_display = "-"
+        tp_display = "-"
+        
+        if "BUY" in last_sig:
             sig_bg = "rgba(0, 255, 0, 0.2)"
-        elif "SELL" in sig_text:
-            sig_col = "#ff1744"
-            sig_bg = "rgba(255, 0, 0, 0.2)"
+            sig_col = "#00e676"
+            entry_display = f"Rp {curr_price:,.0f}"
+            sl_val = curr_price - (2 * atr) # SL Longgar (2x ATR) agar tidak kena gocek
+            tp_val = curr_price + (3 * atr) # RR 1:1.5
+            sl_display = f"Rp {sl_val:,.0f}"
+            tp_display = f"Rp {tp_val:,.0f}"
             
-        def fmt(x): return f"{x:,.0f}".replace(",", ".") if x > 0 else "-"
+        elif "SELL" in last_sig:
+            sig_bg = "rgba(255, 0, 0, 0.2)"
+            sig_col = "#ff1744"
+            entry_display = f"Rp {curr_price:,.0f}"
+            sl_val = curr_price + (2 * atr)
+            tp_val = curr_price - (3 * atr)
+            sl_display = f"Rp {sl_val:,.0f}"
+            tp_display = f"Rp {tp_val:,.0f}"
 
-        # --- LAYOUT ATAS (PASAR) ---
+        # Helper Format
+        def fmt(x): return f"{x:,.0f}".replace(",", ".")
+
+        # --- UI LAYOUT ---
         st.markdown(f"""
         <style>
-            .grid-row {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
-            .grid-plan {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1.5fr; gap: 8px; margin-bottom: 20px; }}
-            .box {{ background: #1e1e1e; border: 1px solid #333; padding: 10px; border-radius: 6px; text-align: center; }}
-            .sig-box {{ background: {sig_bg}; border: 2px solid {sig_col}; padding: 10px; border-radius: 6px; text-align: center; }}
-            .lbl {{ font-size: 9px; color: #aaa; font-weight: bold; margin-bottom: 4px; text-transform: uppercase; }}
-            .val {{ font-size: 14px; color: white; font-weight: bold; }}
-            .val-lg {{ font-size: 16px; color: {sig_col}; font-weight: 900; }}
+            .grid-top {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
+            .grid-bot {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1.5fr; gap: 8px; margin-bottom: 20px; }}
+            .box {{ background: #1e1e1e; border: 1px solid #333; padding: 12px; border-radius: 6px; text-align: center; }}
+            .sig-box {{ background: {sig_bg}; border: 2px solid {sig_col}; padding: 12px; border-radius: 6px; text-align: center; }}
+            .lbl {{ font-size: 10px; color: #bbb; margin-bottom: 4px; font-weight:bold; }}
+            .val {{ font-size: 16px; color: white; font-weight:bold; }}
+            .val-lg {{ font-size: 20px; color: {sig_col}; font-weight:900; }}
         </style>
         
-        <div class="grid-row">
-            <div class="sig-box"><div class="lbl">SINYAL ({tf})</div><div class="val-lg">{sig_text}</div></div>
-            <div class="box"><div class="lbl">HARGA</div><div class="val" style="color:#f1c40f">Rp {fmt(curr)}</div></div>
-            <div class="box"><div class="lbl">LOW 24H</div><div class="val" style="color:#ff1744">{fmt(low_24)}</div></div>
-            <div class="box"><div class="lbl">HIGH 24H</div><div class="val" style="color:#00e676">{fmt(high_24)}</div></div>
-            <div class="box"><div class="lbl">VOLUME</div><div class="val">{vol:,.0f}</div></div>
+        <div class="grid-top">
+            <div class="sig-box"><div class="lbl">SINYAL (EARLY)</div><div class="val-lg">{last_sig}</div></div>
+            <div class="box"><div class="lbl">HARGA</div><div class="val" style="color:#f1c40f">Rp {fmt(curr_price)}</div></div>
+            <div class="box"><div class="lbl">VOLUME</div><div class="val">{ticker['baseVolume']:,.0f}</div></div>
+            <div class="box"><div class="lbl">TREN UTAMA (EMA 200)</div><div class="val" style="color:{trend_color}">{trend_status}</div></div>
         </div>
         
-        <div class="grid-plan">
-            <div class="box" style="border-top: 3px solid #2979ff">
-                <div class="lbl">ENTRY (SWEEP ZONE)</div>
-                <div class="val" style="color:#2979ff">Rp {fmt(entry)}</div>
-            </div>
-            <div class="box" style="border-top: 3px solid #00e676">
-                <div class="lbl">TP (RR 1:2)</div>
-                <div class="val" style="color:#00e676">Rp {fmt(tp)}</div>
-            </div>
-            <div class="box" style="border-top: 3px solid #ff1744">
-                <div class="lbl">SL (SWING LOW)</div>
-                <div class="val" style="color:#ff1744">Rp {fmt(sl)}</div>
-            </div>
-            <div class="box">
-                <div class="lbl">KONFIRMASI MTF ({htf_label})</div>
-                <div class="val" style="color:{'#00e676' if htf_bias=='BULLISH' else '#ff1744'}">{htf_bias}</div>
-            </div>
+        <div class="grid-bot">
+            <div class="box" style="border-top:3px solid #2979ff"><div class="lbl">ENTRY</div><div class="val" style="color:#2979ff">{entry_display}</div></div>
+            <div class="box" style="border-top:3px solid #00e676"><div class="lbl">TARGET PROFIT</div><div class="val" style="color:#00e676">{tp_display}</div></div>
+            <div class="box" style="border-top:3px solid #ff1744"><div class="lbl">STOP LOSS (DINAMIS)</div><div class="val" style="color:#ff1744">{sl_display}</div></div>
+             <div class="box"><div class="lbl">VALIDASI</div><div class="val" style="font-size:12px">{'✅ VOL SPIKE' if df['Vol_Spike'].iloc[-1] else '⚠️ LOW VOL'} | {'✅ MOMENTUM' if (df['K'].iloc[-1] < 80 and df['K'].iloc[-1] > 20) else '⚠️ EXTREME'}</div></div>
         </div>
         """, unsafe_allow_html=True)
-        
-        # --- CHART ---
-        fig = make_subplots(rows=1, cols=1)
-        
-        # 1. Candlestick
-        fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'))
-        
-        # 2. Market Structure (Fractals) - Titik Likuiditas
-        highs = df[df['is_high']]
-        lows = df[df['is_low']]
-        
-        fig.add_trace(go.Scatter(x=highs['timestamp'], y=highs['high'], mode='markers', marker=dict(symbol='triangle-down', size=8, color='orange'), name='Swing High (Liq)'))
-        fig.add_trace(go.Scatter(x=lows['timestamp'], y=lows['low'], mode='markers', marker=dict(symbol='triangle-up', size=8, color='yellow'), name='Swing Low (Liq)'))
-        
-        # 3. Gambar Plan Jika Valid
-        if is_valid:
-            # Garis Entry
-            fig.add_hline(y=entry, line_dash="solid", line_color="blue", annotation_text="ENTRY", line_width=1)
-            # Garis SL
-            fig.add_hline(y=sl, line_dash="dash", line_color="red", annotation_text="STOP LOSS", line_width=1)
-            # Garis TP
-            fig.add_hline(y=tp, line_dash="dash", line_color="green", annotation_text="TAKE PROFIT (1:2)", line_width=1)
-            
-            # Arrow Sinyal
-            fig.add_trace(go.Scatter(
-                x=[df['timestamp'].iloc[-1]], 
-                y=[entry], 
-                mode='markers', 
-                marker=dict(symbol='star', size=15, color='cyan'),
-                name='SIGNAL TRIGGER'
-            ))
 
-        fig.update_layout(height=500, template="plotly_dark", margin=dict(l=0,r=0,t=10,b=0), xaxis_rangeslider_visible=False)
+        # --- CHART SYSTEM ---
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.7, 0.3])
+        
+        # 1. Main Chart (Price + EMA)
+        fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_200'], line=dict(color='yellow', width=2), name='EMA 200 (Trend)'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_50'], line=dict(color='cyan', width=1), name='EMA 50 (Fast)'), row=1, col=1)
+        
+        # Mark Sinyal di Chart
+        buys = df[df['signal'] == "SCALP BUY"]
+        sells = df[df['signal'] == "SCALP SELL"]
+        if not buys.empty:
+            fig.add_trace(go.Scatter(x=buys['timestamp'], y=buys['low'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='BUY'), row=1, col=1)
+        if not sells.empty:
+            fig.add_trace(go.Scatter(x=sells['timestamp'], y=sells['high'], mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ff1744'), name='SELL'), row=1, col=1)
+
+        # 2. Subplot (Stochastic RSI)
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['K'], line=dict(color='#00e676', width=1.5), name='Stoch K'), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df['timestamp'], y=df['D'], line=dict(color='#ff1744', width=1.5), name='Stoch D'), row=2, col=1)
+        # Garis Batas
+        fig.add_hline(y=80, line_dash="dot", line_color="gray", row=2, col=1)
+        fig.add_hline(y=20, line_dash="dot", line_color="gray", row=2, col=1)
+        # Area Aman (Fill)
+        fig.add_hrect(y0=20, y1=80, fillcolor="rgba(255,255,255,0.05)", line_width=0, row=2, col=1)
+
+        fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=0,t=10,b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
-        
-        # --- TABEL ZONA SUPPLY DEMAND & SWEEP ---
-        st.subheader("📋 Catatan Struktur Pasar (Supply/Demand)")
-        
-        # Buat list swing terakhir untuk referensi
-        struct_data = []
-        last_h = highs.tail(3)
-        last_l = lows.tail(3)
-        
-        for i, row in last_h.iterrows():
-            struct_data.append(["Swing High (Likuiditas Atas)", fmt(row['high']), row['timestamp'].strftime('%H:%M')])
-        for i, row in last_l.iterrows():
-            struct_data.append(["Swing Low (Likuiditas Bawah)", fmt(row['low']), row['timestamp'].strftime('%H:%M')])
-            
-        df_struct = pd.DataFrame(struct_data, columns=["Tipe Struktur", "Harga Level", "Waktu Terbentuk"])
-        st.table(df_struct.sort_values(by="Waktu Terbentuk", ascending=False))
 
     except Exception as e:
-        st.error(f"Menunggu pembentukan struktur pasar... ({e})")
+        st.error(f"Menunggu koneksi Indodax... {e}")
 
-show_dashboard(symbol, timeframe)
+main_app(symbol, timeframe)
