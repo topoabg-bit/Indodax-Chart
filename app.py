@@ -7,227 +7,251 @@ from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import pytz
 
-# --- 1. SETUP HALAMAN ---
-st.set_page_config(layout="wide", page_title="SMC Scalping Pro")
+# --- 1. KONFIGURASI ---
+st.set_page_config(layout="wide", page_title="SMC Scalping: Clean Chart")
 
-# --- 2. CORE LOGIC (SMC ENGINE) ---
-def process_data(df):
-    # 1. RSI & ATR
+# --- 2. ENGINE SMC (LOGIC MITIGASI) ---
+def process_smc(df):
+    # A. RSI & ATR
     df['delta'] = df['close'].diff()
-    df['gain'] = (df['delta'].where(df['delta'] > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    df['loss'] = (-df['delta'].where(df['delta'] < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    df['rs'] = df['gain'] / df['loss']
-    df['RSI'] = 100 - (100 / (1 + df['rs']))
+    gain = (df['delta'].where(df['delta'] > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-df['delta'].where(df['delta'] < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
     
-    # ATR
     df['tr'] = np.maximum(df['high'] - df['low'], 
-                          np.maximum(abs(df['high'] - df['close'].shift()), 
-                                     abs(df['low'] - df['close'].shift())))
+               np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
     df['ATR'] = df['tr'].ewm(span=14).mean()
 
-    # 2. DETEKSI FVG (Fair Value Gap)
-    # Kita butuh data Shifted untuk membandingkan candle i, i-1, i-2
-    # Candle i (Current formation), Gap ada di antara i (low/high) dan i-2 (high/low)
+    # B. DETEKSI FVG RAW
+    # Bullish FVG: Low Candle 3 > High Candle 1
+    df['fvg_bull'] = (df['low'] > df['high'].shift(2)) & (df['close'] > df['open'])
+    df['bull_top'] = df['low']           
+    df['bull_bot'] = df['high'].shift(2) 
     
-    # Bullish FVG: Low[i] > High[i-2]
-    df['fvg_bull_cond'] = (df['low'] > df['high'].shift(2)) & (df['close'] > df['open'])
-    df['bull_top'] = df['low']            # Batas Atas Zona Buy
-    df['bull_bot'] = df['high'].shift(2)  # Batas Bawah Zona Buy
-    
-    # Bearish FVG: High[i] < Low[i-2]
-    df['fvg_bear_cond'] = (df['high'] < df['low'].shift(2)) & (df['close'] < df['open'])
-    df['bear_top'] = df['low'].shift(2)   # Batas Atas Zona Sell
-    df['bear_bot'] = df['high']           # Batas Bawah Zona Sell
+    # Bearish FVG: High Candle 3 < Low Candle 1
+    df['fvg_bear'] = (df['high'] < df['low'].shift(2)) & (df['close'] < df['open'])
+    df['bear_top'] = df['low'].shift(2)
+    df['bear_bot'] = df['high']
 
     return df
+
+def check_mitigation(df):
+    # Fungsi ini memfilter FVG yang sudah basi (sudah tersentuh harga masa depan)
+    bullish_zones = []
+    bearish_zones = []
+    
+    # Scan Bullish FVG
+    indices = df.index[df['fvg_bull']]
+    for idx in indices:
+        top = df.loc[idx, 'bull_top']
+        bot = df.loc[idx, 'bull_bot']
+        
+        # Cek candle SETELAH pembentukan FVG (idx+1 sampai akhir)
+        future_candles = df.loc[idx+1:]
+        
+        if future_candles.empty:
+            # FVG terbentuk di candle terakhir (Fresh banget)
+            bullish_zones.append({'idx': idx, 'top': top, 'bot': bot, 'time': df.loc[idx, 'timestamp'], 'status': 'FRESH'})
+            continue
+            
+        # Cek apakah ada Low candle masa depan yang menyentuh Top FVG?
+        # Jika Low <= Top, berarti sudah "Mitigated" (Disentuh)
+        is_mitigated = (future_candles['low'] <= top).any()
+        
+        if not is_mitigated:
+            bullish_zones.append({'idx': idx, 'top': top, 'bot': bot, 'time': df.loc[idx, 'timestamp'], 'status': 'FRESH'})
+        
+        # Jika candle terakhir sedang menyentuh, ini adalah SINYAL
+        elif (future_candles.iloc[-1]['low'] <= top) and (future_candles.iloc[-1]['low'] >= bot):
+             bullish_zones.append({'idx': idx, 'top': top, 'bot': bot, 'time': df.loc[idx, 'timestamp'], 'status': 'TESTING NOW'})
+
+    # Scan Bearish FVG
+    indices = df.index[df['fvg_bear']]
+    for idx in indices:
+        top = df.loc[idx, 'bear_top']
+        bot = df.loc[idx, 'bear_bot']
+        future_candles = df.loc[idx+1:]
+        
+        if future_candles.empty:
+             bearish_zones.append({'idx': idx, 'top': top, 'bot': bot, 'time': df.loc[idx, 'timestamp'], 'status': 'FRESH'})
+             continue
+             
+        # Jika High >= Bot, berarti Mitigated
+        is_mitigated = (future_candles['high'] >= bot).any()
+        
+        if not is_mitigated:
+            bearish_zones.append({'idx': idx, 'top': top, 'bot': bot, 'time': df.loc[idx, 'timestamp'], 'status': 'FRESH'})
+        elif (future_candles.iloc[-1]['high'] >= bot) and (future_candles.iloc[-1]['high'] <= top):
+            bearish_zones.append({'idx': idx, 'top': top, 'bot': bot, 'time': df.loc[idx, 'timestamp'], 'status': 'TESTING NOW'})
+            
+    return bullish_zones, bearish_zones
 
 def get_data(symbol, timeframe):
     exchange = ccxt.indodax()
     ticker = exchange.fetch_ticker(symbol)
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=150) # Limit kecil agar loading cepat untuk scalping
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=200)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Jakarta')
     return df, ticker
 
-# --- 3. VISUALISASI & DASHBOARD ---
-st.sidebar.header("⚡ SMC Scalper")
-symbol = st.sidebar.selectbox("Market", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR', 'PEPE/IDR'])
+# --- 3. DASHBOARD ---
+st.sidebar.header("Scalping Setup")
+symbol = st.sidebar.selectbox("Pasar", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['15m', '1h', '4h'])
 
-st.title(f"Scalping Terminal: {symbol}")
+st.title(f"SMC Scalper: {symbol}")
 
 @st.fragment(run_every=30)
-def render_dashboard(sym, tf):
+def show_dashboard(sym, tf):
     try:
         df_raw, ticker = get_data(sym, tf)
-        df = process_data(df_raw)
+        df = process_smc(df_raw)
+        bull_zones, bear_zones = check_mitigation(df)
         
-        # Data Terkini
-        curr_price = float(ticker['last'])
-        curr_rsi = df['RSI'].iloc[-1]
-        curr_atr = df['ATR'].iloc[-1]
+        curr = float(ticker['last'])
+        rsi = df['RSI'].iloc[-1]
+        atr = df['ATR'].iloc[-1]
         
-        # --- ALGORITMA PENCARIAN SINYAL ---
-        # Kita cari FVG valid TERAKHIR (Closest to Price)
+        # --- ANALISA SINYAL ---
+        signal_text = "WAITING FOR RETEST..."
+        signal_bg = "#262730"
+        signal_col = "#aaa"
         
-        signal_status = "WAITING..."
-        signal_color = "#777"
-        entry_zone_text = "-"
-        sl_text = "-"
-        tp_text = "-"
+        active_plan = None
         
-        # Ambil 5 FVG Bullish & Bearish terakhir
-        last_bulls = df[df['fvg_bull_cond']].tail(5)
-        last_bears = df[df['fvg_bear_cond']].tail(5)
-        
-        active_fvg = None
-        fvg_type = None
-        
-        # Cek apakah harga ada di dalam zona Bullish FVG?
-        for idx, row in last_bulls.iterrows():
-            # Jika harga masuk area (Retest)
-            if row['bull_bot'] <= curr_price <= row['bull_top']*1.01: # Toleransi 1%
-                if curr_rsi < 50: # Konfirmasi RSI
-                    signal_status = "SCALP BUY (RETEST)"
-                    signal_color = "#00e676"
-                    active_fvg = row
-                    fvg_type = "bull"
-        
-        # Cek Bearish
-        for idx, row in last_bears.iterrows():
-            if row['bear_bot']*0.99 <= curr_price <= row['bear_top']:
-                if curr_rsi > 50:
-                    signal_status = "SCALP SELL (RETEST)"
-                    signal_color = "#ff1744"
-                    active_fvg = row
-                    fvg_type = "bear"
+        # Cek apakah ada zona yang statusnya "TESTING NOW"
+        # Prioritas Sinyal
+        for z in bull_zones:
+            if z['status'] == 'TESTING NOW' and rsi < 50:
+                signal_text = "BUY SIGNAL (FVG RETEST)"
+                signal_bg = "rgba(0, 255, 0, 0.2)"
+                signal_col = "#00e676"
+                active_plan = z
+                active_plan['type'] = 'bull'
+                break # Ambil satu saja
+                
+        if active_plan is None:
+            for z in bear_zones:
+                if z['status'] == 'TESTING NOW' and rsi > 50:
+                    signal_text = "SELL SIGNAL (FVG RETEST)"
+                    signal_bg = "rgba(255, 0, 0, 0.2)"
+                    signal_col = "#ff1744"
+                    active_plan = z
+                    active_plan['type'] = 'bear'
+                    break
 
-        # --- PLAN GENERATOR ---
+        # --- FORMAT ANGKA ---
         def fmt(x): return f"{x:,.0f}".replace(",", ".")
         
-        if active_fvg is not None:
-            if fvg_type == "bull":
-                entry_top = active_fvg['bull_top']
-                entry_bot = active_fvg['bull_bot']
-                entry_zone_text = f"{fmt(entry_bot)} - {fmt(entry_top)}"
-                
-                sl_val = entry_bot - (1.5 * curr_atr)
-                risk = active_fvg['bull_top'] - sl_val
-                tp_val = active_fvg['bull_top'] + (risk * 2) # RR 1:2
-                
-                sl_text = fmt(sl_val)
-                tp_text = fmt(tp_val)
-                
+        sl_txt, tp_txt, entry_txt = "-", "-", "-"
+        
+        if active_plan:
+            if active_plan['type'] == 'bull':
+                entry_txt = f"{fmt(active_plan['bot'])} - {fmt(active_plan['top'])}"
+                sl_val = active_plan['bot'] - (1.5 * atr)
+                risk = active_plan['top'] - sl_val
+                tp_val = active_plan['top'] + (risk * 2)
             else:
-                entry_top = active_fvg['bear_top']
-                entry_bot = active_fvg['bear_bot']
-                entry_zone_text = f"{fmt(entry_bot)} - {fmt(entry_top)}"
-                
-                sl_val = entry_top + (1.5 * curr_atr)
-                risk = sl_val - active_fvg['bear_bot']
-                tp_val = active_fvg['bear_bot'] - (risk * 2)
-                
-                sl_text = fmt(sl_val)
-                tp_text = fmt(tp_val)
-        
-        # Jika Waiting, tampilkan FVG terdekat sebagai "Next Zone"
-        elif not last_bulls.empty:
-             latest = last_bulls.iloc[-1]
-             entry_zone_text = f"Next Buy: {fmt(latest['bull_bot'])}-{fmt(latest['bull_top'])}"
-        
-        # --- UI HTML ---
+                entry_txt = f"{fmt(active_plan['bot'])} - {fmt(active_plan['top'])}"
+                sl_val = active_plan['top'] + (1.5 * atr)
+                risk = sl_val - active_plan['bot']
+                tp_val = active_plan['bot'] - (risk * 2)
+            
+            sl_txt = fmt(sl_val)
+            tp_txt = fmt(tp_val)
+
+        # --- UI DASHBOARD ---
         st.markdown(f"""
         <style>
-            .main-grid {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
-            .plan-grid {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 15px; }}
-            .box {{ background: #1e1e1e; border: 1px solid #333; padding: 12px; border-radius: 6px; text-align: center; }}
-            .sig-box {{ background: {signal_color}20; border: 2px solid {signal_color}; padding: 12px; border-radius: 6px; text-align: center; }}
-            .lbl {{ font-size: 10px; color: #bbb; font-weight: bold; margin-bottom: 4px; }}
-            .val {{ font-size: 16px; color: white; font-weight: bold; }}
-            .val-lg {{ font-size: 18px; color: {signal_color}; font-weight: 900; }}
+            .stat-container {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
+            .plan-container {{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 8px; margin-bottom: 15px; }}
+            .box {{ background: #1e1e1e; border: 1px solid #333; padding: 10px; border-radius: 6px; text-align: center; }}
+            .sig-box {{ background: {signal_bg}; border: 2px solid {signal_col}; padding: 10px; border-radius: 6px; text-align: center; }}
+            .lbl {{ font-size: 9px; color: #aaa; font-weight: bold; margin-bottom: 3px; }}
+            .val {{ font-size: 14px; color: white; font-weight: bold; }}
+            .val-lg {{ font-size: 16px; color: {signal_col}; font-weight: 900; }}
         </style>
         
-        <div class="main-grid">
-            <div class="sig-box"><div class="lbl">SIGNAL STATUS</div><div class="val-lg">{signal_status}</div></div>
-            <div class="box"><div class="lbl">HARGA RUNNING</div><div class="val" style="color:#f1c40f">Rp {fmt(curr_price)}</div></div>
-            <div class="box"><div class="lbl">RSI MOMENTUM</div><div class="val">{curr_rsi:.1f}</div></div>
-            <div class="box"><div class="lbl">VOLATILITY (ATR)</div><div class="val">{curr_atr:,.0f}</div></div>
+        <div class="stat-container">
+            <div class="sig-box"><div class="lbl">STATUS PASAR</div><div class="val-lg">{signal_text}</div></div>
+            <div class="box"><div class="lbl">HARGA</div><div class="val" style="color:#f1c40f">Rp {fmt(curr)}</div></div>
+            <div class="box"><div class="lbl">RSI</div><div class="val">{rsi:.1f}</div></div>
+            <div class="box"><div class="lbl">ATR (VOLATILITAS)</div><div class="val">{atr:,.0f}</div></div>
         </div>
         
-        <div class="plan-grid">
-            <div class="box" style="border-top:3px solid #2979ff">
-                <div class="lbl">ENTRY ZONE (FVG AREA)</div>
-                <div class="val" style="color:#2979ff; font-size:14px">{entry_zone_text}</div>
+        <div class="plan-container">
+            <div class="box" style="border-top: 2px solid #2962ff">
+                <div class="lbl">ZONA ENTRY (LIMIT)</div>
+                <div class="val" style="color:#2962ff">{entry_txt}</div>
             </div>
-            <div class="box" style="border-top:3px solid #ff1744">
-                <div class="lbl">STOP LOSS</div>
-                <div class="val" style="color:#ff1744">{sl_text}</div>
+            <div class="box" style="border-top: 2px solid #ff1744">
+                <div class="lbl">STOP LOSS (1.5x ATR)</div>
+                <div class="val" style="color:#ff1744">{sl_txt}</div>
             </div>
-            <div class="box" style="border-top:3px solid #00e676">
-                <div class="lbl">TAKE PROFIT</div>
-                <div class="val" style="color:#00e676">{tp_text}</div>
-            </div>
-            <div class="box">
-                <div class="lbl">CONFIRMATION</div>
-                <div class="val" style="font-size:12px">{'✅ RSI OK' if (fvg_type=='bull' and curr_rsi<50) or (fvg_type=='bear' and curr_rsi>50) else '⚠️ WAIT RSI'}</div>
+            <div class="box" style="border-top: 2px solid #00e676">
+                <div class="lbl">TAKE PROFIT (1:2)</div>
+                <div class="val" style="color:#00e676">{tp_txt}</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # --- CHARTING (CLEAN FVG AREAS) ---
+        # --- CHARTING ---
         fig = make_subplots(rows=1, cols=1)
         
-        # 1. Candlestick
+        # 1. Candle
         fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'))
         
-        # 2. Draw FVG Boxes (Last 3 only)
-        # Helper untuk gambar kotak
-        def draw_fvg_box(row, type_fvg):
-            t_start = row['timestamp']
-            # Proyeksi kotak ke kanan (sampai candle terakhir + 5 candle depan)
-            t_end = df['timestamp'].iloc[-1] + timedelta(minutes=15*5) # Estimasi visual
-            
-            if type_fvg == 'bull':
-                y0, y1 = row['bull_bot'], row['bull_top']
-                color = "rgba(0, 230, 118, 0.15)" # Hijau Transparan
-                line_col = "rgba(0, 230, 118, 0.5)"
-                label = f"FVG UP\n{y0:,.0f}"
-            else:
-                y0, y1 = row['bear_bot'], row['bear_top']
-                color = "rgba(255, 23, 68, 0.15)" # Merah Transparan
-                line_col = "rgba(255, 23, 68, 0.5)"
-                label = f"FVG DOWN\n{y1:,.0f}"
-
-            # Add Rectangle Shape
-            fig.add_shape(type="rect",
-                x0=t_start, y0=y0, x1=t_end, y1=y1,
-                fillcolor=color, line=dict(color=line_col, width=1),
-            )
-            # Add Text Label (Di tengah kotak)
-            fig.add_trace(go.Scatter(
-                x=[t_start], y=[(y0+y1)/2],
-                mode="text", text=[label], textposition="middle right",
-                textfont=dict(size=9, color=line_col), showlegend=False
-            ))
-
-        # Loop 3 terakhir agar chart bersih
-        for i, row in df[df['fvg_bull_cond']].tail(3).iterrows():
-            draw_fvg_box(row, 'bull')
-            
-        for i, row in df[df['fvg_bear_cond']].tail(3).iterrows():
-            draw_fvg_box(row, 'bear')
-
-        # Layout
+        # 2. Gambar FVG (Hanya yang FRESH / Belum Mitigasi)
+        # Kita hanya gambar 5 zona terdekat dengan harga sekarang agar chart bersih
+        
+        def draw_zone(zones, color, name):
+            count = 0
+            for z in reversed(zones): # Mulai dari yang terbaru
+                if count >= 3: break # Limit 3 kotak per tipe
+                
+                # Tentukan warna berdasarkan status
+                fill_col = color
+                line_w = 0
+                if z['status'] == 'TESTING NOW':
+                    fill_col = "rgba(255, 215, 0, 0.3)" # Kuning jika sedang dites
+                    line_w = 2
+                
+                # Gambar Kotak
+                fig.add_shape(type="rect",
+                    x0=z['time'], y0=z['bot'], 
+                    x1=df['timestamp'].iloc[-1] + timedelta(minutes=60*4), # Extend ke masa depan
+                    y1=z['top'],
+                    fillcolor=fill_col, line=dict(width=line_w, color="yellow"),
+                )
+                count += 1
+        
+        draw_zone(bull_zones, "rgba(0, 230, 118, 0.2)", "Buy Zone")  # Hijau Transparan
+        draw_zone(bear_zones, "rgba(255, 23, 68, 0.2)", "Sell Zone") # Merah Transparan
+        
         fig.update_layout(
-            height=550, 
+            height=500, 
             template="plotly_dark", 
-            margin=dict(l=0,r=50,t=30,b=0), # Right margin untuk label
+            margin=dict(l=0,r=0,t=10,b=0), 
             xaxis_rangeslider_visible=False,
-            title=dict(text="SMC Liquidity Zones", font=dict(size=12, color="#555"))
+            title_text=""
         )
         st.plotly_chart(fig, use_container_width=True)
+        
+        # --- TABEL DAFTAR ZONE (DI BAWAH CHART) ---
+        st.markdown("### 📋 Daftar Zona Supply & Demand (Unmitigated)")
+        
+        # Siapkan data untuk tabel
+        table_data = []
+        for z in reversed(bull_zones[-5:]): # Ambil 5 terbaru
+            table_data.append(["🟢 DEMAND (BUY)", fmt(z['top']), fmt(z['bot']), z['status']])
+        for z in reversed(bear_zones[-5:]):
+            table_data.append(["🔴 SUPPLY (SELL)", fmt(z['top']), fmt(z['bot']), z['status']])
+            
+        df_table = pd.DataFrame(table_data, columns=["Tipe", "Harga Atas", "Harga Bawah", "Status"])
+        st.table(df_table)
 
     except Exception as e:
-        st.error(f"Menunggu data pasar... ({e})")
+        st.error(f"Sedang memindai struktur... {e}")
 
-render_dashboard(symbol, timeframe)
+show_dashboard(symbol, timeframe)
