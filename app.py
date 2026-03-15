@@ -3,270 +3,228 @@ import ccxt
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots  # <-- Import yang sebelumnya hilang
 from datetime import datetime, timedelta
 import pytz
 
-# --- 1. KONFIGURASI ---
-st.set_page_config(layout="wide", page_title="Scalping Pro: Trend + SMC")
+# --- 1. KONFIGURASI HALAMAN ---
+st.set_page_config(layout="wide", page_title="Indodax Scalper Pro")
 
-# --- 2. ENGINE PERHITUNGAN ---
-def get_htf_trend(symbol, ltf_timeframe):
-    """
-    Mengambil data Timeframe yang lebih tinggi (2 tingkat diatas) 
-    untuk Filter Trend.
-    15m -> 1h, 1h -> 4h, 4h -> 1d
-    """
-    tf_map = {'15m': '1h', '1h': '4h', '4h': '1d', '1d': '1w'}
-    htf = tf_map.get(ltf_timeframe, '1d')
+# --- 2. ENGINE ANALISA ---
+def get_htf_trend(symbol, ltf_tf):
+    """Mengambil Tren dari Timeframe lebih tinggi (Filter)"""
+    tf_map = {'15m': '1h', '1h': '4h', '4h': '1d'}
+    htf = tf_map.get(ltf_tf, '1h')
     
     exchange = ccxt.indodax()
-    ohlcv = exchange.fetch_ohlcv(symbol, htf, limit=50)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    
-    # Menghitung EMA 50 pada HTF sebagai Trend Baseline
-    df['HTF_EMA'] = df['close'].ewm(span=50, adjust=False).mean()
-    
-    # Return Trend terakhir: Bullish/Bearish & Nilai EMA
-    last_row = df.iloc[-1]
-    trend = "BULLISH" if last_row['close'] > last_row['HTF_EMA'] else "BEARISH"
-    return trend, last_row['HTF_EMA']
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, htf, limit=50)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # EMA 50 sebagai Trend Filter
+        ema_htf = df['close'].ewm(span=50).mean().iloc[-1]
+        return ema_htf, "BULLISH" if df['close'].iloc[-1] > ema_htf else "BEARISH"
+    except:
+        return 0, "NEUTRAL"
 
-def get_daily_pivot(symbol):
-    """Mengambil Pivot Point Harian untuk Magnet Harga"""
-    exchange = ccxt.indodax()
-    # Ambil candle kemarin (Daily)
-    ohlcv = exchange.fetch_ohlcv(symbol, '1d', limit=2) 
-    prev_day = ohlcv[-2] # Candle kemarin yang sudah close
+def process_scalping_data(df, htf_ema):
+    # A. Indikator Dasar
+    df['RSI'] = 100 - (100 / (1 + df['close'].diff().clip(lower=0).ewm(alpha=1/14).mean() / 
+                             abs(df['close'].diff().clip(upper=0)).ewm(alpha=1/14).mean()))
     
-    high = prev_day[2]
-    low = prev_day[3]
-    close = prev_day[4]
+    df['ATR'] = np.maximum(df['high'] - df['low'], 
+                np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift()))).ewm(span=14).mean()
     
-    pivot = (high + low + close) / 3
-    r1 = (2 * pivot) - low
-    s1 = (2 * pivot) - high
-    return pivot, r1, s1
+    df['VOL_MA'] = df['volume'].rolling(20).mean()
 
-def process_scalping_logic(df, htf_ema_val):
-    # 1. Indikator Dasar
-    # RSI (Filter Pucuk)
-    delta = df['close'].diff()
-    gain = (delta.where(delta > 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/14, adjust=False).mean()
-    rs = gain / loss
-    df['RSI'] = 100 - (100 / (1 + rs))
+    # B. Struktur Pasar (21 Candle) - Atap & Lantai Scalping
+    df['HH'] = df['high'].rolling(21).max().shift(1)
+    df['LL'] = df['low'].rolling(21).min().shift(1)
     
-    # Volume MA (Filter Volume)
-    df['VOL_MA'] = df['volume'].rolling(window=20).mean()
+    # C. FVG Detection (Bullish Only untuk Buy)
+    # Gap antara Low candle sekarang dan High candle 2 bar lalu
+    df['fvg_bull'] = (df['low'] > df['high'].shift(2)) & (df['close'] > df['open'])
+    df['fvg_top'] = df['low']
+    df['fvg_bot'] = df['high'].shift(2)
 
-    # 2. Struktur Pasar (Price Action 21 Period)
-    # Mencari Atap (Highest High) dan Lantai (Lowest Low) dalam 21 bar terakhir
-    df['HH_21'] = df['high'].rolling(window=21).max().shift(1) # Shift 1 agar tidak repainting
-    df['LL_21'] = df['low'].rolling(window=21).min().shift(1)
+    # D. Logika Sinyal
+    df['signal'] = "WAIT"
     
-    # 3. Pivot Structure (Fractals - Deteksi Dini)
-    # Fractal High: High di tengah lebih tinggi dari 2 kiri dan 2 kanan
-    df['is_fractal_high'] = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(2)) & \
-                            (df['high'] > df['high'].shift(-1)) & (df['high'] > df['high'].shift(-2))
-    # Propagasi nilai Fractal High terakhir ke baris saat ini (Last Swing High)
-    df['LAST_SWING_HIGH'] = df['high'].where(df['is_fractal_high']).ffill()
-
-    # 4. Smart Money FVG (Auto Cleaning)
-    # Logika: Gap antara Low candle i dan High candle i-2
-    df['fvg_bull_cond'] = (df['low'] > df['high'].shift(2)) & (df['close'] > df['open'])
-    df['bull_top'] = df['low']
-    df['bull_bot'] = df['high'].shift(2)
+    # Kondisi A: TREND FOLLOW (Aman)
+    # Harga > HTF EMA + Breakout HH Struktur + Volume > Rata2
+    cond_trend = (df['close'] > htf_ema) & (df['close'] > df['HH']) & (df['volume'] > df['VOL_MA'])
     
-    # 5. LOGIKA SINYAL ENTRY
-    df['signal'] = "NEUTRAL"
+    # Kondisi B: REVERSAL (Agresif)
+    # Harga < HTF EMA tapi RSI Oversold (<30) dan mulai naik + Breakout minor
+    cond_rev = (df['close'] < htf_ema) & (df['RSI'] < 35) & (df['close'] > df['open']) 
     
-    # Loop iterasi manual untuk FVG Cleaning & Signal Confirmation (Simulasi Realtime)
-    # Kita hanya iterasi 5 candle terakhir untuk efisiensi
-    last_indices = df.index[-5:]
+    df.loc[cond_trend, 'signal'] = "TREND BUY"
+    df.loc[cond_rev, 'signal'] = "REVERSAL BUY"
     
-    for i in last_indices:
-        close = df.loc[i, 'close']
-        vol = df.loc[i, 'volume']
-        vol_ma = df.loc[i, 'VOL_MA']
-        swing_high = df.loc[i, 'LAST_SWING_HIGH']
-        hh_21 = df.loc[i, 'HH_21']
-        
-        # A. KONDISI TRENDING (Follow Trend)
-        # Harga > HTF EMA (Filter) + Breakout HH 21 + Volume Kuat
-        if (close > htf_ema_val) and (close > hh_21) and (vol > vol_ma) and (df.loc[i, 'RSI'] < 70):
-            df.loc[i, 'signal'] = "TREND BUY"
-            
-        # B. KONDISI REVERSAL (Early Entry)
-        # Harga Breakout Swing High Terakhir (ChoCh) + Volume Kuat (Walaupun dibawah HTF EMA)
-        elif (close > swing_high) and (vol > vol_ma) and (close < htf_ema_val):
-            df.loc[i, 'signal'] = "REVERSAL BUY"
-            
     return df
 
-def get_active_fvgs(df):
-    """
-    Logika AUTO CLEANING:
-    Hanya mengembalikan FVG yang:
-    1. Fresh (Belum tersentuh/mitigated oleh candle setelahnya)
-    2. Tidak terlalu tua (Maksimal 50 candle ke belakang untuk scalping)
-    """
-    bull_zones = []
+def get_clean_fvgs(df):
+    """Auto-Cleaning Logic: Hapus FVG yang sudah tertembus/terisi"""
+    clean_zones = []
+    candidates = df[df['fvg_bull']]
     
-    # Ambil semua kandidat FVG
-    candidates = df[df['fvg_bull_cond']]
-    
-    # Loop dari yang paling baru ke lama
     for idx in reversed(candidates.index):
-        # Batas Waktu (Expiry)
-        if idx < df.index[-50]: 
-            break
+        if idx < df.index[-60]: break # Expired (terlalu lama)
+        
+        top = df.loc[idx, 'fvg_top']
+        bot = df.loc[idx, 'fvg_bot']
+        
+        # Cek masa depan
+        future = df.loc[idx+1:]
+        if future.empty:
+            clean_zones.append({'time': df.loc[idx,'timestamp'], 'top': top, 'bot': bot, 'status': 'FRESH'})
+            continue
             
-        top = df.loc[idx, 'bull_top']
-        bot = df.loc[idx, 'bull_bot']
-        
-        # Cek Mitigasi: Apakah ada candle SETELAH pembentukan FVG ini yang Low-nya menembus Top FVG?
-        # Ambil slice data masa depan relatif terhadap FVG ini
-        future_data = df.loc[idx+1:]
-        
-        if future_data.empty:
-            is_mitigated = False
+        # Jika ada harga low masa depan yang menembus TOP, berarti sudah dijemput (Mitigated)
+        if (future['low'] <= top).any():
+            continue # Skip, jangan tampilkan
         else:
-            # Jika ada Low candle masa depan yang <= Top FVG, berarti celah sudah diisi
-            is_mitigated = (future_data['low'] <= top).any()
+            clean_zones.append({'time': df.loc[idx,'timestamp'], 'top': top, 'bot': bot, 'status': 'FRESH'})
+            if len(clean_zones) >= 3: break # Max 3 zona
             
-        if not is_mitigated:
-            bull_zones.append({
-                'time': df.loc[idx, 'timestamp'],
-                'top': top,
-                'bot': bot
-            })
-            # Limit max 3 zona terdekat agar chart bersih
-            if len(bull_zones) >= 3: break
-            
-    return bull_zones
+    return clean_zones
 
-def fetch_data(symbol, timeframe):
+def get_data(symbol, tf):
     exchange = ccxt.indodax()
-    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=100)
+    ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=200)
     df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Jakarta')
-    return df, exchange.fetch_ticker(symbol)
+    ticker = exchange.fetch_ticker(symbol)
+    return df, ticker
 
-# --- 3. DASHBOARD VISUAL ---
-st.sidebar.header("⚙️ Scalping Parameters")
-symbol = st.sidebar.selectbox("Aset", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR', 'PEPE/IDR'])
+# --- 3. TAMPILAN UTAMA ---
+st.sidebar.header("Scalper Control")
+symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['15m', '1h', '4h'])
 
-st.title(f"⚡ Scalping Terminal: {symbol}")
+st.title(f"⚔️ Scalping Command: {symbol}")
 
 @st.fragment(run_every=30)
-def show_dashboard(sym, tf):
+def dashboard(sym, tf):
     try:
-        # 1. Fetch Data Utama & Pendukung
-        df, ticker = fetch_data(sym, tf)
-        htf_trend_dir, htf_ema_val = get_htf_trend(sym, tf)
-        pivot, r1, s1 = get_daily_pivot(sym)
+        # 1. Proses Data
+        df, ticker = get_data(sym, tf)
+        htf_ema, htf_trend = get_htf_trend(sym, tf)
+        df = process_scalping_data(df, htf_ema)
+        fvgs = get_clean_fvgs(df)
         
-        # 2. Kalkulasi
-        df = process_scalping_logic(df, htf_ema_val)
-        active_fvgs = get_active_fvgs(df)
+        # 2. Variabel Realtime
+        curr = float(ticker['last'])
+        vol = float(ticker['baseVolume'])
+        high_24 = float(ticker['high'])
+        low_24 = float(ticker['low'])
+        last_sig = df['signal'].iloc[-1]
+        atr = df['ATR'].iloc[-1]
         
-        # 3. Data Terkini
-        curr_price = float(ticker['last'])
-        last_signal = df['signal'].iloc[-1]
-        if last_signal == "NEUTRAL" and df['signal'].iloc[-2] != "NEUTRAL":
-            last_signal = df['signal'].iloc[-2] # Cek 1 candle belakang
-            
-        # Warna & Status
-        trend_color = "#00e676" if htf_trend_dir == "BULLISH" else "#ff1744"
+        # Warna Sinyal
+        sig_col = "#777"
         sig_bg = "#1e1e1e"
-        sig_col = "#aaa"
-        
-        if "BUY" in last_signal:
-            sig_bg = "rgba(0, 255, 0, 0.2)"
+        if "BUY" in last_sig:
             sig_col = "#00e676"
+            sig_bg = "rgba(0, 255, 0, 0.2)"
             
-        # --- HEADER METRICS ---
+        # Hitung Plan (JIKA ADA SINYAL / TREND BAGUS)
+        if htf_trend == "BULLISH":
+            prediksi = "LANJUT NAIK (UPTREND)"
+            entry_plan = curr
+            sl_plan = curr - (1.5 * atr)
+            tp_plan = curr + (3 * atr) # RR 1:2
+        else:
+            prediksi = "HATI-HATI (DOWNTREND)"
+            entry_plan = 0
+            sl_plan = 0
+            tp_plan = 0
+
+        # Format Rupiah
+        def fmt(x): return f"{x:,.0f}".replace(",", ".") if x > 0 else "-"
+        
+        # --- LAYOUT HTML ---
         st.markdown(f"""
         <style>
-            .metric-container {{ display: flex; gap: 10px; margin-bottom: 20px; }}
-            .card {{ flex: 1; background: #1e1e1e; border: 1px solid #333; padding: 15px; border-radius: 8px; text-align: center; }}
-            .lbl {{ font-size: 10px; color: #888; margin-bottom: 5px; font-weight: bold; text-transform: uppercase; }}
-            .val {{ font-size: 18px; font-weight: bold; color: white; }}
-            .sig-val {{ font-size: 20px; font-weight: 900; color: {sig_col}; }}
+            .row-1 {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
+            .row-2 {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1.5fr; gap: 8px; margin-bottom: 20px; }}
+            .box {{ background: #1e1e1e; border: 1px solid #333; padding: 12px; border-radius: 6px; text-align: center; }}
+            .sig-box {{ background: {sig_bg}; border: 2px solid {sig_col}; padding: 12px; border-radius: 6px; text-align: center; }}
+            .lbl {{ font-size: 10px; color: #bbb; font-weight: bold; margin-bottom: 4px; text-transform: uppercase; }}
+            .val {{ font-size: 15px; color: white; font-weight: bold; }}
+            .val-lg {{ font-size: 18px; color: {sig_col}; font-weight: 900; }}
         </style>
         
-        <div class="metric-container">
-            <div class="card" style="background: {sig_bg}; border: 1px solid {sig_col};">
-                <div class="lbl">SINYAL SCALPING</div>
-                <div class="sig-val">{last_signal}</div>
+        <!-- BARIS 1: STATUS PASAR -->
+        <div class="row-1">
+            <div class="sig-box">
+                <div class="lbl">SINYAL LIVE</div>
+                <div class="val-lg">{last_sig}</div>
             </div>
-            <div class="card">
-                <div class="lbl">HARGA ({htf_trend_dir})</div>
-                <div class="val" style="color:{trend_color}">Rp {curr_price:,.0f}</div>
+            <div class="box">
+                <div class="lbl">HARGA</div>
+                <div class="val" style="color:#f1c40f">Rp {fmt(curr)}</div>
             </div>
-            <div class="card">
-                <div class="lbl">MAGNET PIVOT (DAILY)</div>
-                <div class="val" style="color: #29b6f6;">Rp {pivot:,.0f}</div>
+            <div class="box"><div class="lbl">LOW 24J</div><div class="val" style="color:#ff1744">{fmt(low_24)}</div></div>
+            <div class="box"><div class="lbl">HIGH 24J</div><div class="val" style="color:#00e676">{fmt(high_24)}</div></div>
+            <div class="box"><div class="lbl">VOLUME</div><div class="val">{vol:,.0f}</div></div>
+        </div>
+
+        <!-- BARIS 2: PLAN SCALPING -->
+        <div class="row-2">
+            <div class="box" style="border-top: 3px solid #2979ff">
+                <div class="lbl">PLAN ENTRY</div>
+                <div class="val" style="color:#2979ff">Rp {fmt(entry_plan)}</div>
             </div>
-             <div class="card">
-                <div class="lbl">STRUKTUR BREAKOUT</div>
-                <div class="val" style="color: #ffb74d;">Rp {df['HH_21'].iloc[-1]:,.0f}</div>
+            <div class="box" style="border-top: 3px solid #00e676">
+                <div class="lbl">TARGET (TP)</div>
+                <div class="val" style="color:#00e676">Rp {fmt(tp_plan)}</div>
+            </div>
+            <div class="box" style="border-top: 3px solid #ff1744">
+                <div class="lbl">STOP LOSS (ATR)</div>
+                <div class="val" style="color:#ff1744">Rp {fmt(sl_plan)}</div>
+            </div>
+            <div class="box">
+                <div class="lbl">PREDIKSI TREN</div>
+                <div class="val" style="color:{'#00e676' if htf_trend=='BULLISH' else '#ff1744'}">{prediksi}</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
 
-        # --- CHARTING ---
+        # --- CHART ---
         fig = make_subplots(rows=1, cols=1)
         
-        # 1. Candlestick
-        fig.add_trace(go.Candlestick(
-            x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'],
-            name='Price'
-        ))
+        # 1. Candle
+        fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Harga'))
         
-        # 2. HTF Trend Filter (Garis Putus-Putus sebagai Batas)
-        fig.add_hline(y=htf_ema_val, line_dash="dash", line_color=trend_color, annotation_text=f"HTF TREND FILTER ({htf_trend_dir})", annotation_position="bottom right")
-
-        # 3. Pivot Magnet (Garis Biru Tipis)
-        fig.add_hline(y=pivot, line_width=1, line_color="#29b6f6", annotation_text="DAILY PIVOT (MAGNET)", annotation_position="top right")
-
-        # 4. FVG Boxes (Fresh Only)
-        for fvg in active_fvgs:
-            # Gambar Kotak Transparan
+        # 2. Filter Trend (Garis Putus2)
+        fig.add_hline(y=htf_ema, line_dash="dash", line_color="orange", annotation_text=f"Trend Filter ({htf_trend})", annotation_position="top left")
+        
+        # 3. FVG Zones (Fresh Only)
+        for fvg in fvgs:
+            # Gambar Kotak Transparan Hijau (Demand)
             fig.add_shape(type="rect",
-                x0=fvg['time'], y0=fvg['bot'], 
-                x1=df['timestamp'].iloc[-1] + timedelta(minutes=30*4), # Extends ke kanan
+                x0=fvg['time'], y0=fvg['bot'], x1=df['timestamp'].iloc[-1] + timedelta(hours=2), # Extend ke kanan
                 y1=fvg['top'],
-                fillcolor="rgba(0, 230, 118, 0.2)", line=dict(width=0), # Hijau Transparan
+                fillcolor="rgba(0, 255, 128, 0.2)", line_width=0
             )
-            # Label Harga FVG
-            fig.add_annotation(x=fvg['time'], y=fvg['top'], text="FVG", showarrow=False, yshift=5, font=dict(size=8, color="#00e676"))
-
-        # 5. Sinyal Entry Arrows
+        
+        # 4. Sinyal Panah
         buys = df[df['signal'].str.contains("BUY")]
         if not buys.empty:
-            fig.add_trace(go.Scatter(
-                x=buys['timestamp'], y=buys['low'], mode='markers', 
-                marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='Buy Signal'
-            ))
+             fig.add_trace(go.Scatter(x=buys['timestamp'], y=buys['low'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='Buy Signal'))
 
-        fig.update_layout(
-            height=550, template="plotly_dark", margin=dict(l=0,r=0,t=10,b=0), 
-            xaxis_rangeslider_visible=False,
-            title_text=""
-        )
+        fig.update_layout(height=500, template="plotly_dark", margin=dict(l=0,r=0,t=10,b=0), xaxis_rangeslider_visible=False)
         st.plotly_chart(fig, use_container_width=True)
         
-        # Penjelasan Logic
-        st.caption(f"""
-        **Logika Scalping:**
-        1. **Trend Filter:** Menggunakan EMA 50 pada Timeframe diatasnya (Saat ini: Harga {'DIATAS' if curr_price > htf_ema_val else 'DIBAWAH'} Filter).
-        2. **Structure:** Breakout High 21-Bar terakhir di Rp {df['HH_21'].iloc[-1]:,.0f}.
-        3. **Smart Money:** Kotak Hijau adalah area 'Celah Harga' yang belum diisi (Fresh FVG). Bagus untuk entry retest.
-        """)
+        # --- TABEL FVG DI BAWAH ---
+        st.subheader("📋 Zona Smart Money (Fresh FVG)")
+        if fvgs:
+            fvg_data = [[f"Rp {fmt(z['bot'])} - Rp {fmt(z['top'])}", z['status'], z['time'].strftime('%H:%M')] for z in fvgs]
+            st.table(pd.DataFrame(fvg_data, columns=["Area Harga (Demand)", "Status", "Waktu Terbentuk"]))
+        else:
+            st.info("Tidak ada FVG segar. Pasar efisien (tidak ada celah).")
 
     except Exception as e:
-        st.error(f"Memproses data pasar... {e}")
+        st.error(f"Error: {e}")
 
-show_dashboard(symbol, timeframe)
+dashboard(symbol, timeframe)
