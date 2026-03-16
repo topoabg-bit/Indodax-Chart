@@ -6,29 +6,30 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import pytz
-import requests  # <--- PERLU INSTALL: pip install requests
+import requests
 
 # --- 1. KONFIGURASI ---
-st.set_page_config(layout="wide", page_title="Scalper V6 + Telegram Notif")
+st.set_page_config(layout="wide", page_title="Scalper V7: Final Fix")
 
-# --- 2. FUNGSI KIRIM TELEGRAM ---
+# --- 2. TELEGRAM SETTINGS ---
 def send_telegram(message):
-    # --- ISI DATA BOT ANDA DISINI ---
-    BOT_TOKEN = "7992906337:AAGPstFckZsaMmabZDA6m_EauP-aTqQxlZQ" 
+    # ==========================================
+    # ISI TOKEN & CHAT ID ANDA DI BAWAH INI:
+    BOT_TOKEN = "7992906337:AAGPstFckZsaMmabZDA6m_EauP-aTqQxlZQ"
     CHAT_ID = "8107526630"
-    # --------------------------------
+    # ==========================================
     
     if BOT_TOKEN == "7992906337:AAGPstFckZsaMmabZDA6m_EauP-aTqQxlZQ":
-        return # Belum disetting
+        return 
         
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     params = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
     try:
-        requests.get(url, params=params, timeout=5)
+        requests.get(url, params=params, timeout=3)
     except:
         pass
 
-# --- 3. ENGINE DATA & INDIKATOR (SAMA SEPERTI SEBELUMNYA) ---
+# --- 3. DATA ENGINE ---
 def get_data(symbol, tf):
     exchange = ccxt.indodax()
     try:
@@ -42,20 +43,22 @@ def get_data(symbol, tf):
         st.error(f"Koneksi Error: {e}")
         return pd.DataFrame(), None
 
+# --- 4. INDIKATOR & LOGIC ---
 def process_indicators(df):
     if df.empty: return df
+    # Trend
     df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
-    
+    # MACD
     ema12 = df['close'].ewm(span=12, adjust=False).mean()
     ema26 = df['close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema12 - ema26
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['Hist'] = df['MACD'] - df['Signal']
-    
+    # ATR
     df['tr'] = np.maximum(df['high'] - df['low'], 
                np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
     df['ATR'] = df['tr'].ewm(span=14).mean()
-    
+    # Volume & Candle
     df['Vol_MA'] = df['volume'].rolling(20).mean()
     df['Vol_Spike'] = df['volume'] > df['Vol_MA']
     
@@ -70,24 +73,20 @@ def detect_zones(df):
     vol_ma = df['volume'].rolling(20).mean()
     body = (df['close'] - df['open']).abs()
     avg_body = body.rolling(20).mean()
-    start = max(0, len(df) - 150)
     
+    start = max(0, len(df) - 150)
     for i in range(start, len(df)-2):
         curr = df.iloc[i]
         prev = df.iloc[i-1]
         is_impulse = (curr['volume'] > vol_ma.iloc[i]) and (body.iloc[i] > avg_body.iloc[i])
         
         if is_impulse and curr['close'] > curr['open'] and prev['close'] < prev['open']:
-            zones.append({
-                'type': 'DEMAND', 'top': prev['high'], 'bot': prev['low'], 'time': prev['timestamp'],
-                'color': 'rgba(41, 182, 246, 0.3)', 'line': 'rgba(41, 182, 246, 0.8)'
-            })
+            zones.append({'type': 'DEMAND', 'top': prev['high'], 'bot': prev['low'], 'time': prev['timestamp'],
+                          'color': 'rgba(41, 182, 246, 0.3)', 'line': 'rgba(41, 182, 246, 0.8)'})
         elif is_impulse and curr['close'] < curr['open'] and prev['close'] > prev['open']:
-            zones.append({
-                'type': 'SUPPLY', 'top': prev['high'], 'bot': prev['low'], 'time': prev['timestamp'],
-                'color': 'rgba(255, 167, 38, 0.3)', 'line': 'rgba(255, 167, 38, 0.8)'
-            })
-    
+            zones.append({'type': 'SUPPLY', 'top': prev['high'], 'bot': prev['low'], 'time': prev['timestamp'],
+                          'color': 'rgba(255, 167, 38, 0.3)', 'line': 'rgba(255, 167, 38, 0.8)'})
+            
     active = []
     for z in zones:
         future = df[df['timestamp'] > z['time']]
@@ -106,6 +105,7 @@ def generate_signals(df, zones):
     
     for i in range(start, len(df)):
         row = df.iloc[i]
+        # BUY Logic
         if row['MACD'] > row['Signal'] and (row['Bull_Engulf'] or row['Vol_Spike']):
             for z in zones:
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
@@ -113,9 +113,9 @@ def generate_signals(df, zones):
                         sl = z['bot'] - row['ATR']
                         tp = z['top'] + ((z['top'] - sl) * 2)
                         df.loc[df.index[i], 'sig_buy'] = True
-                        history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY', 'Entry': row['close'], 'SL': sl, 'TP': tp})
+                        history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
                         break
-                        
+        # SELL Logic
         if row['MACD'] < row['Signal'] and (row['Bear_Engulf'] or row['Vol_Spike']):
             for z in zones:
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
@@ -123,15 +123,14 @@ def generate_signals(df, zones):
                         sl = z['top'] + row['ATR']
                         tp = z['bot'] - ((sl - z['bot']) * 2)
                         df.loc[df.index[i], 'sig_sell'] = True
-                        history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL', 'Entry': row['close'], 'SL': sl, 'TP': tp})
+                        history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
                         break
     return df, history
 
-# --- 4. DASHBOARD + LOGIKA NOTIFIKASI ---
-st.sidebar.header("🎛️ Scalping Controller")
+# --- 5. MAIN DASHBOARD ---
+st.sidebar.header("🎛️ Scalper Controller")
 symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['1m', '15m', '30m', '1h', '4h'])
-
 st.title(f"Scalping Pro: {symbol} ({timeframe})")
 
 @st.fragment(run_every=60)
@@ -142,7 +141,7 @@ def dashboard(sym, tf):
     zones = detect_zones(df)
     df, history = generate_signals(df, zones)
     
-    # Vars
+    # Realtime Vars
     curr = float(ticker['last'])
     vol = float(ticker['baseVolume'])
     high24 = float(ticker['high'])
@@ -150,8 +149,7 @@ def dashboard(sym, tf):
     atr = df['ATR'].iloc[-1]
     ema200 = df['EMA_200'].iloc[-1]
     
-    # --- LOGIKA NOTIFIKASI TELEGRAM (ANTI SPAM) ---
-    # Kita gunakan Session State untuk menyimpan waktu sinyal terakhir yg dikirim
+    # --- NOTIFICATION LOGIC ---
     if 'last_alert_time' not in st.session_state:
         st.session_state['last_alert_time'] = None
 
@@ -161,44 +159,35 @@ def dashboard(sym, tf):
     
     if history:
         last_sig = history[-1]
-        # Cek apakah sinyal terjadi di candle terakhir
         if last_sig['Waktu'] == df['timestamp'].iloc[-1]:
-            
-            is_new_signal = False
+            # Cek Notifikasi Baru
+            is_new = False
             if st.session_state['last_alert_time'] != last_sig['Waktu']:
-                is_new_signal = True
+                is_new = True
                 st.session_state['last_alert_time'] = last_sig['Waktu']
             
             if last_sig['Tipe'] == 'BUY':
                 status_txt = "BUY SIGNAL"
                 sig_col = "#00e676"
-                msg_header = "🟢 *BUY SIGNAL DETECTED!*"
+                msg_head = "🟢 *BUY SIGNAL!*"
             else:
                 status_txt = "SELL SIGNAL"
                 sig_col = "#ff1744"
-                msg_header = "🔴 *SELL SIGNAL DETECTED!*"
+                msg_head = "🔴 *SELL SIGNAL!*"
                 
             entry_plan = f"Rp {last_sig['Entry']:,.0f}"
             tp_plan = f"Rp {last_sig['TP']:,.0f}"
             sl_plan = f"Rp {last_sig['SL']:,.0f}"
             
-            # KIRIM PESAN JIKA BARU
-            if is_new_signal:
-                pesan = f"""
-{msg_header}
-Asset: {sym} ({tf})
-Price: {entry_plan}
-TP: {tp_plan}
-SL: {sl_plan}
-Time: {last_sig['Waktu'].strftime('%H:%M')}
-"""
-                send_telegram(pesan)
-                st.toast(f"Sinyal Terkirim ke Telegram!", icon="🚀")
+            if is_new:
+                msg = f"{msg_head}\nAsset: {sym} ({tf})\nPrice: {entry_plan}\nTP: {tp_plan}\nSL: {sl_plan}\nTime: {last_sig['Waktu'].strftime('%H:%M')}"
+                send_telegram(msg)
+                st.toast("Sinyal Terkirim!", icon="🚀")
 
-    # Helper Format
+    # Helper
     def fmt(x): return f"{x:,.0f}".replace(",", ".")
 
-    # --- LAYOUT ---
+    # --- HTML LAYOUT ---
     st.markdown(f"""
     <style>
         .row-1 {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
@@ -211,7 +200,7 @@ Time: {last_sig['Waktu'].strftime('%H:%M')}
     </style>
 
     <div class="row-1">
-        <div class="sig-box"><div class="lbl">STATUS SINYAL</div><div class="val-lg">{status_txt}</div></div>
+        <div class="sig-box"><div class="lbl">STATUS</div><div class="val-lg">{status_txt}</div></div>
         <div class="box"><div class="lbl">HARGA</div><div class="val" style="color:#f1c40f">Rp {fmt(curr)}</div></div>
         <div class="box"><div class="lbl">LOW 24J</div><div class="val" style="color:#ff1744">{fmt(low24)}</div></div>
         <div class="box"><div class="lbl">HIGH 24J</div><div class="val" style="color:#00e676">{fmt(high24)}</div></div>
@@ -227,9 +216,9 @@ Time: {last_sig['Waktu'].strftime('%H:%M')}
     </div>
     """, unsafe_allow_html=True)
     
-    # Chart & Tables (Sama seperti V6)
-    rng_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
-    rng_start = df['timestamp'].iloc[-60]
+    # --- CHART ---
+    range_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
+    range_start = df['timestamp'].iloc[-60]
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
     fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
@@ -248,36 +237,33 @@ Time: {last_sig['Waktu'].strftime('%H:%M')}
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], line=dict(color='#2962ff'), name='MACD'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Signal'], line=dict(color='#ff9100'), name='Signal'), row=2, col=1)
     
-    fig.update_layout(height=550, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), xaxis_range=[rng_start, rng_end], xaxis2_range=[rng_start, rng_end], xaxis_rangeslider_visible=False)
+    fig.update_layout(height=550, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), xaxis_range=[range_start, range_end], xaxis2_range=[range_start, range_end], xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
     
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("📋 Supply & Demand")
+        st.subheader("📋 Zona Supply & Demand (Limit Order)")
         if zones:
-            z_data = [[f"{'🟦 DEMAND' if z['type']=='DEMAND' else '🟧 SUPPLY'}", f"Rp {fmt(z['bot'])} - {fmt(z['top'])}", z['time'].strftime('%H:%M')] for z in reversed(zones[-5:])]
-            st.table(pd.DataFrame(z_data, columns=["Tipe", "Range Harga", "Waktu"]))
+            z_data = [[f"{'🟦 DEMAND' if z['type']=='DEMAND' else '🟧 SUPPLY'}", f"Rp {fmt(z['bot'])} - {fmt(z['top'])}", z['time'].strftime('%H:%M %d/%m')] for z in reversed(zones[-5:])]
+            st.table(pd.DataFrame(z_data, columns=["Tipe", "Rentang Harga", "Waktu"]))
     with col2:
-        st.subheader("📊 Histori Sinyal")
+        st.subheader("📊 Histori Sinyal (100 Candle Terakhir)")
         if history:
-            h_df = pd.DataFrame(history).iloc[::-1] # Urutan terbaru di atas
-        
-            # FORMATTING KE STRING AGAR BERSIH (Hapus +07:00)
-            # Kita konversi dulu ke string dengan format Jam:Menit Tanggal/Bulan
-            h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M (%d/%m)')
-        
-            # Format Mata Uang
+            h_df = pd.DataFrame(history).iloc[::-1]
+            
+            # --- FIX FORMAT WAKTU & HARGA DISINI ---
+            h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M (%d/%m)') # Hanya Jam:Menit (Tgl/Bln)
+            
             h_df['Harga Entry'] = h_df['Entry'].apply(lambda x: f"Rp {fmt(x)}")
             h_df['Stop Loss'] = h_df['SL'].apply(lambda x: f"Rp {fmt(x)}")
             h_df['Take Profit'] = h_df['TP'].apply(lambda x: f"Rp {fmt(x)}")
-        
-           # Tampilkan Tabel
-           st.dataframe(
-               h_df[['Waktu', 'Tipe', 'Harga Entry', 'Stop Loss', 'Take Profit', 'Status']], 
-               use_container_width=True,
-               hide_index=True # Sembunyikan nomor baris index 0,1,2 agar rapi
-           )
-       else:
-           st.caption("Belum ada sinyal valid yang terdeteksi pada 100 candle terakhir.")
-        
+            
+            st.dataframe(
+                h_df[['Waktu', 'Tipe', 'Harga Entry', 'Stop Loss', 'Take Profit', 'Status']], 
+                use_container_width=True,
+                hide_index=True
+            )
+        else:
+            st.caption("Belum ada sinyal valid.")
+
 dashboard(symbol, timeframe)
