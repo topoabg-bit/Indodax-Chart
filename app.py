@@ -255,7 +255,7 @@ def dashboard(sym, tf):
     if df['sig_sell'].any():
         fig.add_trace(go.Scatter(x=df[df['sig_sell']]['timestamp'], y=df[df['sig_sell']]['high'], mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ff1744'), name='Sell'), row=1, col=1)
 
-    fig.add_trace(go.Bar(x=df['timestamp'], y=df['Hist'], marker_color=np.where(df['Hist']<0, '#ff1744', '#00e676')), row=2, col=1)
+    fig.add_trace(go.Bar(x=df['timestamp'], y=df['Hist'], name='Histogram', marker_color=np.where(df['Hist']<0, '#ff1744', '#00e676')), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], line=dict(color='#2962ff'), name='MACD'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Signal'], line=dict(color='#ff9100'), name='Signal'), row=2, col=1)
     
