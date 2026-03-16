@@ -260,7 +260,24 @@ Time: {last_sig['Waktu'].strftime('%H:%M')}
     with col2:
         st.subheader("📊 Histori Sinyal")
         if history:
-            h_df = pd.DataFrame(history).iloc[::-1]
-            st.dataframe(h_df[['Waktu', 'Tipe', 'Entry', 'TP']].style.format({"Entry": "Rp {:,.0f}", "TP": "Rp {:,.0f}"}), use_container_width=True)
-
+        h_df = pd.DataFrame(history).iloc[::-1] # Urutan terbaru di atas
+        
+        # FORMATTING KE STRING AGAR BERSIH (Hapus +07:00)
+        # Kita konversi dulu ke string dengan format Jam:Menit Tanggal/Bulan
+        h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M (%d/%m)')
+        
+        # Format Mata Uang
+        h_df['Harga Entry'] = h_df['Entry'].apply(lambda x: f"Rp {fmt(x)}")
+        h_df['Stop Loss'] = h_df['SL'].apply(lambda x: f"Rp {fmt(x)}")
+        h_df['Take Profit'] = h_df['TP'].apply(lambda x: f"Rp {fmt(x)}")
+        
+        # Tampilkan Tabel
+        st.dataframe(
+            h_df[['Waktu', 'Tipe', 'Harga Entry', 'Stop Loss', 'Take Profit', 'Status']], 
+            use_container_width=True,
+            hide_index=True # Sembunyikan nomor baris index 0,1,2 agar rapi
+        )
+    else:
+        st.caption("Belum ada sinyal valid yang terdeteksi pada 100 candle terakhir.")
+        
 dashboard(symbol, timeframe)
