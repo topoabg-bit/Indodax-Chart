@@ -130,7 +130,7 @@ def generate_signals(df, zones):
 # --- 5. MAIN DASHBOARD ---
 st.sidebar.header("🎛️ Scalper Controller")
 symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR'])
-timeframe = st.sidebar.selectbox("Timeframe", ['1m', '15m', '30m', '1h', '4h'])
+timeframe = st.sidebar.selectbox("Timeframe", ['1m', '15m', '30m', '1h', '4h', '1d'])
 st.title(f"Scalping Pro: {symbol} ({timeframe})")
 
 @st.fragment(run_every=60)
