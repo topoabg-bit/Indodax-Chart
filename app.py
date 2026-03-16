@@ -8,18 +8,17 @@ from datetime import datetime, timedelta
 import pytz
 
 # --- 1. KONFIGURASI ---
-st.set_page_config(layout="wide", page_title="Scalper V5: History & Signals")
+st.set_page_config(layout="wide", page_title="Scalper Pro V6: Precision Layout")
 
-# --- 2. DATA & TEKNIKAL ---
+# --- 2. ENGINE DATA ---
 def get_data(symbol, tf):
     exchange = ccxt.indodax()
     try:
-        # Ambil 500 candle
+        # Ambil 500 data untuk perhitungan indikator akurat
         ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=500)
         if not ohlcv: return pd.DataFrame(), None
         
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        # Waktu WIB
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Jakarta')
         ticker = exchange.fetch_ticker(symbol)
         return df, ticker
@@ -27,10 +26,11 @@ def get_data(symbol, tf):
         st.error(f"Koneksi Error: {e}")
         return pd.DataFrame(), None
 
+# --- 3. ENGINE INDIKATOR ---
 def process_indicators(df):
     if df.empty: return df
     
-    # EMA 200 Trend
+    # Trend (EMA 200)
     df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
     
     # MACD
@@ -40,274 +40,245 @@ def process_indicators(df):
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['Hist'] = df['MACD'] - df['Signal']
     
-    # Volume & ATR
-    df['Vol_MA'] = df['volume'].rolling(20).mean()
-    df['Vol_Spike'] = df['volume'] > df['Vol_MA']
-    
+    # Volatility (ATR)
     df['tr'] = np.maximum(df['high'] - df['low'], 
                np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
     df['ATR'] = df['tr'].ewm(span=14).mean()
     
-    # Pola Candle
-    df['Bull_Engulf'] = (df['close'] > df['open']) & (df['close'] > df['open'].shift(1)) & \
-                        (df['open'] < df['close'].shift(1)) & (df['close'].shift(1) < df['open'].shift(1))
+    # Volume Spike & Candle Pattern
+    df['Vol_MA'] = df['volume'].rolling(20).mean()
+    df['Vol_Spike'] = df['volume'] > df['Vol_MA']
     
+    df['Bull_Engulf'] = (df['close'] > df['open']) & (df['close'] > df['open'].shift(1)) & \
+                        (df['open'] < df['close'].shift(1))
     df['Bear_Engulf'] = (df['close'] < df['open']) & (df['close'] < df['open'].shift(1)) & \
-                        (df['open'] > df['close'].shift(1)) & (df['close'].shift(1) > df['open'].shift(1))
+                        (df['open'] > df['close'].shift(1))
     return df
 
+# --- 4. ENGINE SUPPLY DEMAND ---
 def detect_zones(df):
-    """ Deteksi Supply & Demand 100 Candle Terakhir """
     zones = []
     vol_ma = df['volume'].rolling(20).mean()
-    body_size = (df['close'] - df['open']).abs()
-    avg_body = body_size.rolling(20).mean()
+    body = (df['close'] - df['open']).abs()
+    avg_body = body.rolling(20).mean()
     
-    start_scan = max(0, len(df) - 150) # Scan 150 candle terakhir
+    # Scan 150 candle terakhir
+    start = max(0, len(df) - 150)
     
-    for i in range(start_scan, len(df)-2):
+    for i in range(start, len(df)-2):
         curr = df.iloc[i]
         prev = df.iloc[i-1]
+        is_impulse = (curr['volume'] > vol_ma.iloc[i]) and (body.iloc[i] > avg_body.iloc[i])
         
-        is_impulsive = (curr['volume'] > vol_ma.iloc[i]) and (body_size.iloc[i] > avg_body.iloc[i])
-        
-        # DEMAND (Biru)
-        if is_impulsive and curr['close'] > curr['open'] and prev['close'] < prev['open']:
+        # DEMAND (Biru Muda Transparan)
+        if is_impulse and curr['close'] > curr['open'] and prev['close'] < prev['open']:
             zones.append({
-                'type': 'DEMAND', 'top': prev['high'], 'bot': prev['low'], 
-                'time': prev['timestamp'], 'color': 'rgba(41, 182, 246, 0.3)', 'border': 'rgba(41, 182, 246, 0.8)'
+                'type': 'DEMAND', 'top': prev['high'], 'bot': prev['low'], 'time': prev['timestamp'],
+                'color': 'rgba(41, 182, 246, 0.3)', 'line': 'rgba(41, 182, 246, 0.8)'
             })
-        # SUPPLY (Orange)
-        elif is_impulsive and curr['close'] < curr['open'] and prev['close'] > prev['open']:
+        # SUPPLY (Orange Transparan)
+        elif is_impulse and curr['close'] < curr['open'] and prev['close'] > prev['open']:
             zones.append({
-                'type': 'SUPPLY', 'top': prev['high'], 'bot': prev['low'], 
-                'time': prev['timestamp'], 'color': 'rgba(255, 167, 38, 0.3)', 'border': 'rgba(255, 167, 38, 0.8)'
+                'type': 'SUPPLY', 'top': prev['high'], 'bot': prev['low'], 'time': prev['timestamp'],
+                'color': 'rgba(255, 167, 38, 0.3)', 'line': 'rgba(255, 167, 38, 0.8)'
             })
             
-    # Filter Zone Aktif
-    active_zones = []
+    # Filter Broken Zones
+    active = []
     for z in zones:
-        future_df = df[df['timestamp'] > z['time']]
-        if future_df.empty: 
-            active_zones.append(z)
-            continue
-            
-        # Hapus jika ditembus body candle
-        if z['type'] == 'DEMAND':
-            if not (future_df['close'] < z['bot']).any(): active_zones.append(z)
+        future = df[df['timestamp'] > z['time']]
+        if future.empty: 
+            active.append(z)
+        elif z['type'] == 'DEMAND':
+            if not (future['close'] < z['bot']).any(): active.append(z)
         else:
-            if not (future_df['close'] > z['top']).any(): active_zones.append(z)
+            if not (future['close'] > z['top']).any(): active.append(z)
             
-    return active_zones
+    return active
 
-def generate_signals_and_history(df, zones):
-    """
-    Looping untuk mencari histori sinyal Buy/Sell
-    berdasarkan logika MACD + SnD
-    """
-    history_log = []
+# --- 5. ENGINE SINYAL & HISTORI ---
+def generate_signals(df, zones):
+    history = []
+    df['sig_buy'] = False
+    df['sig_sell'] = False
     
-    # Kita hanya scan 100 candle terakhir untuk histori agar tidak terlalu berat
-    start_idx = max(0, len(df) - 100)
+    # Scan candle untuk sinyal
+    start = max(0, len(df) - 100)
     
-    for i in range(start_idx, len(df)):
+    for i in range(start, len(df)):
         row = df.iloc[i]
-        close = row['close']
         
-        # Cari zone yang relevan pada saat candle tersebut terjadi
-        # Logika: Apakah harga Low/High menyentuh zone?
-        
-        # 1. CEK SINYAL BUY
-        # Syarat: Candle Bullish/Spike + MACD Cross Up/Bullish + Harga di Demand
-        macd_bull = row['MACD'] > row['Signal']
-        trigger = row['Bull_Engulf'] or row['Vol_Spike']
-        
-        if macd_bull and trigger:
-            # Cek apakah ada di Demand Zone?
+        # LOGIKA BUY
+        if row['MACD'] > row['Signal'] and (row['Bull_Engulf'] or row['Vol_Spike']):
             for z in zones:
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
-                    # Harga masuk area
                     if row['low'] <= z['top']*1.005 and row['high'] >= z['bot']:
-                        # SINYAL VALID
                         sl = z['bot'] - row['ATR']
-                        risk = z['top'] - sl
-                        tp = z['top'] + (risk * 2)
-                        
-                        # Simpan ke DF untuk Chart
+                        tp = z['top'] + ((z['top'] - sl) * 2)
                         df.loc[df.index[i], 'sig_buy'] = True
+                        history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
+                        break
                         
-                        # Simpan ke History Log
-                        history_log.append({
-                            'Waktu': row['timestamp'].strftime('%d/%m %H:%M'),
-                            'Tipe': '🟢 BUY',
-                            'Harga Entry': row['close'],
-                            'Stop Loss': sl,
-                            'Take Profit': tp,
-                            'Status': 'Selesai' if i < len(df)-5 else 'Aktif'
-                        })
-                        break # Satu sinyal per candle cukup
-
-        # 2. CEK SINYAL SELL
-        macd_bear = row['MACD'] < row['Signal']
-        trigger_sell = row['Bear_Engulf'] or row['Vol_Spike']
-        
-        if macd_bear and trigger_sell:
+        # LOGIKA SELL
+        if row['MACD'] < row['Signal'] and (row['Bear_Engulf'] or row['Vol_Spike']):
             for z in zones:
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
                     if row['high'] >= z['bot']*0.995 and row['low'] <= z['top']:
                         sl = z['top'] + row['ATR']
-                        risk = sl - z['bot']
-                        tp = z['bot'] - (risk * 2)
-                        
+                        tp = z['bot'] - ((sl - z['bot']) * 2)
                         df.loc[df.index[i], 'sig_sell'] = True
-                        
-                        history_log.append({
-                            'Waktu': row['timestamp'].strftime('%d/%m %H:%M'),
-                            'Tipe': '🔴 SELL',
-                            'Harga Entry': row['close'],
-                            'Stop Loss': sl,
-                            'Take Profit': tp,
-                            'Status': 'Selesai' if i < len(df)-5 else 'Aktif'
-                        })
+                        history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
                         break
+                        
+    return df, history
 
-    return df, history_log
-
-# --- 3. DASHBOARD UTAMA ---
-st.sidebar.header("🎛️ Scalper Dashboard V5")
+# --- 6. DASHBOARD VISUAL ---
+st.sidebar.header("🎛️ Scalping Controller")
 symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['1m', '15m', '30m', '1h', '4h'])
-
-st.title(f"Scalping Master: {symbol} ({timeframe})")
+st.title(f"Scalping Pro: {symbol} ({timeframe})")
 
 @st.fragment(run_every=60)
-def main_app(sym, tf):
-    # 1. Get Data
+def dashboard(sym, tf):
+    # 1. Process
     df, ticker = get_data(sym, tf)
     if df.empty: return
-    
     df = process_indicators(df)
     zones = detect_zones(df)
+    df, history = generate_signals(df, zones)
     
-    # 2. Generate History & Signals
-    df, history = generate_signals_and_history(df, zones)
+    # 2. Realtime Vars
+    curr = float(ticker['last'])
+    vol = float(ticker['baseVolume'])
+    high24 = float(ticker['high'])
+    low24 = float(ticker['low'])
+    atr = df['ATR'].iloc[-1]
+    ema200 = df['EMA_200'].iloc[-1]
     
-    # 3. Status Realtime (Ambil sinyal terakhir dari History jika baru saja terjadi)
-    curr_price = float(ticker['last'])
-    last_signal = history[-1] if history else None
-    
-    # Cek apakah sinyal terakhir masih relevan (baru terjadi 1-3 candle lalu)
+    # 3. Status & Plan
     status_txt = "WAITING..."
     sig_col = "#777"
+    entry_plan = "-"
+    tp_plan = "-"
+    sl_plan = "-"
     
-    # Jika sinyal terakhir terjadi di candle terakhir atau sebelumnya
-    if last_signal and last_signal['Status'] == 'Aktif':
-        if "BUY" in last_signal['Tipe']:
-            status_txt = "BUY SIGNAL ACTIVE"
-            sig_col = "#00e676"
-        else:
-            status_txt = "SELL SIGNAL ACTIVE"
-            sig_col = "#ff1744"
+    # Cek Sinyal Terakhir (Relevansi 3 candle terakhir)
+    if history:
+        last_sig = history[-1]
+        if last_sig['Waktu'] >= df['timestamp'].iloc[-3]:
+            if last_sig['Tipe'] == 'BUY':
+                status_txt = "BUY SIGNAL"
+                sig_col = "#00e676"
+            else:
+                status_txt = "SELL SIGNAL"
+                sig_col = "#ff1744"
+            
+            entry_plan = f"Rp {last_sig['Entry']:,.0f}"
+            tp_plan = f"Rp {last_sig['TP']:,.0f}"
+            sl_plan = f"Rp {last_sig['SL']:,.0f}"
     
-    # Format Angka
+    # Jika waiting, cek apakah di dalam zone (Persiapan)
+    if status_txt == "WAITING...":
+        for z in zones:
+            if z['type'] == 'DEMAND' and curr <= z['top'] and curr >= z['bot']:
+                status_txt = "PREPARE BUY (LIMIT)"
+                sig_col = "#ffeb3b" # Kuning
+                entry_plan = f"{z['bot']:,.0f}-{z['top']:,.0f}"
+            elif z['type'] == 'SUPPLY' and curr >= z['bot'] and curr <= z['top']:
+                status_txt = "PREPARE SELL (LIMIT)"
+                sig_col = "#ff9100" # Orange
+                entry_plan = f"{z['bot']:,.0f}-{z['top']:,.0f}"
+
     def fmt(x): return f"{x:,.0f}".replace(",", ".")
 
-    # --- HTML LAYOUT ---
+    # --- LAYOUT REQUESTED ---
     st.markdown(f"""
     <style>
-        .grid-main {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 15px; }}
-        .box {{ background: #1e1e1e; border: 1px solid #333; padding: 10px; border-radius: 6px; text-align: center; }}
-        .sig-box {{ background: {sig_col}20; border: 2px solid {sig_col}; padding: 10px; border-radius: 6px; text-align: center; }}
-        .lbl {{ font-size: 10px; color: #aaa; font-weight: bold; margin-bottom: 4px; }}
-        .val {{ font-size: 16px; font-weight: bold; color: white; }}
-        .val-lg {{ font-size: 20px; font-weight: 900; color: {sig_col}; }}
+        /* Baris 1: 5 Kolom */
+        .row-1 {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
+        /* Baris 2: 5 Kolom */
+        .row-2 {{ display: grid; grid-template-columns: 1fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 20px; }}
+        
+        .box {{ background: #1e1e1e; border: 1px solid #333; padding: 8px; border-radius: 6px; text-align: center; }}
+        .sig-box {{ background: {sig_col}20; border: 2px solid {sig_col}; padding: 8px; border-radius: 6px; text-align: center; }}
+        .lbl {{ font-size: 9px; color: #aaa; font-weight: bold; margin-bottom: 3px; text-transform: uppercase; }}
+        .val {{ font-size: 14px; font-weight: bold; color: white; }}
+        .val-lg {{ font-size: 18px; font-weight: 900; color: {sig_col}; }}
     </style>
-    
-    <div class="grid-main">
-        <div class="sig-box">
-            <div class="lbl">STATUS SINYAL</div>
-            <div class="val-lg">{status_txt}</div>
-        </div>
-        <div class="box">
-            <div class="lbl">HARGA SAAT INI</div>
-            <div class="val" style="color:#f1c40f">Rp {fmt(curr_price)}</div>
-        </div>
-        <div class="box">
-            <div class="lbl">VOLATILITAS (ATR)</div>
-            <div class="val">{fmt(df['ATR'].iloc[-1])}</div>
-        </div>
-        <div class="box">
-            <div class="lbl">TREND (EMA 200)</div>
-            <div class="val" style="color:{'#00e676' if curr_price > df['EMA_200'].iloc[-1] else '#ff1744'}">
-                {'BULLISH' if curr_price > df['EMA_200'].iloc[-1] else 'BEARISH'}
-            </div>
+
+    <!-- BARIS 1: INFO PASAR -->
+    <div class="row-1">
+        <div class="sig-box"><div class="lbl">STATUS SINYAL</div><div class="val-lg">{status_txt}</div></div>
+        <div class="box"><div class="lbl">HARGA SAAT INI</div><div class="val" style="color:#f1c40f">Rp {fmt(curr)}</div></div>
+        <div class="box"><div class="lbl">LOW 24J</div><div class="val" style="color:#ff1744">{fmt(low24)}</div></div>
+        <div class="box"><div class="lbl">HIGH 24J</div><div class="val" style="color:#00e676">{fmt(high24)}</div></div>
+        <div class="box"><div class="lbl">VOLUME</div><div class="val">{fmt(vol)}</div></div>
+    </div>
+
+    <!-- BARIS 2: ENTRY PLAN & TEKNIKAL -->
+    <div class="row-2">
+        <div class="box" style="border-top: 3px solid #29b6f6"><div class="lbl">ENTRY PLAN</div><div class="val" style="color:#29b6f6">{entry_plan}</div></div>
+        <div class="box" style="border-top: 3px solid #00e676"><div class="lbl">TAKE PROFIT</div><div class="val" style="color:#00e676">{tp_plan}</div></div>
+        <div class="box" style="border-top: 3px solid #ff1744"><div class="lbl">STOP LOSS</div><div class="val" style="color:#ff1744">{sl_plan}</div></div>
+        <div class="box"><div class="lbl">VOLATILITY (ATR)</div><div class="val">{fmt(atr)}</div></div>
+        <div class="box"><div class="lbl">TREND (EMA 200)</div>
+            <div class="val" style="color:{'#00e676' if curr > ema200 else '#ff1744'}">{'BULLISH' if curr > ema200 else 'BEARISH'}</div>
         </div>
     </div>
     """, unsafe_allow_html=True)
     
-    # --- CHART (ZOOMED 60 Candle) ---
-    # Logic Zoom
-    range_end = df['timestamp'].iloc[-1] + timedelta(minutes=30)
-    range_start = df['timestamp'].iloc[-60] # Tampilkan 60 candle terakhir
-    
+    # --- CHART ZOOMED ---
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
     
     # 1. Candle
-    fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Harga'), row=1, col=1)
-    
-    # 2. EMA 200
+    fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_200'], line=dict(color='yellow', width=2), name='EMA 200'), row=1, col=1)
     
-    # 3. Supply Demand Zones
+    # 2. Zones
     for z in zones:
         end_t = df['timestamp'].iloc[-1] + timedelta(hours=4)
         fig.add_shape(type="rect", x0=z['time'], y0=z['bot'], x1=end_t, y1=z['top'], 
-                      fillcolor=z['color'], line_color=z['border'], line_width=1, row=1, col=1)
-                      
-    # 4. Arrows (Marker) Sinyal
-    if 'sig_buy' in df.columns:
-        buys = df[df['sig_buy'] == True]
-        fig.add_trace(go.Scatter(x=buys['timestamp'], y=buys['low'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='Buy Signal'), row=1, col=1)
-        
-    if 'sig_sell' in df.columns:
-        sells = df[df['sig_sell'] == True]
-        fig.add_trace(go.Scatter(x=sells['timestamp'], y=sells['high'], mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ff1744'), name='Sell Signal'), row=1, col=1)
+                      fillcolor=z['color'], line_color=z['line'], line_width=1, row=1, col=1)
+    
+    # 3. Arrows
+    if df['sig_buy'].any():
+        buys = df[df['sig_buy']]
+        fig.add_trace(go.Scatter(x=buys['timestamp'], y=buys['low'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='Buy'), row=1, col=1)
+    if df['sig_sell'].any():
+        sells = df[df['sig_sell']]
+        fig.add_trace(go.Scatter(x=sells['timestamp'], y=sells['high'], mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ff1744'), name='Sell'), row=1, col=1)
 
-    # 5. MACD
+    # 4. MACD
     fig.add_trace(go.Bar(x=df['timestamp'], y=df['Hist'], marker_color=np.where(df['Hist']<0, '#ff1744', '#00e676'), name='Hist'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], line=dict(color='#2962ff'), name='MACD'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Signal'], line=dict(color='#ff9100'), name='Signal'), row=2, col=1)
     
-    fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), xaxis_rangeslider_visible=False,
-                      xaxis_range=[range_start, range_end], xaxis2_range=[range_start, range_end])
+    # Zoom 60 Candle
+    rng_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
+    rng_start = df['timestamp'].iloc[-60]
+    
+    fig.update_layout(height=550, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), xaxis_rangeslider_visible=False,
+                      xaxis_range=[rng_start, rng_end], xaxis2_range=[rng_start, rng_end])
     st.plotly_chart(fig, use_container_width=True)
     
-    # --- TABEL 1: SUPPLY & DEMAND (PLANNING) ---
-    st.subheader("📋 Area Supply & Demand (Untuk Limit Order)")
+    # --- TABEL 1: SUPPLY DEMAND ---
+    st.subheader("📋 Zona Supply & Demand (Limit Order)")
     if zones:
-        snd_data = []
-        for z in reversed(zones[-5:]):
-            tipe = "🟦 DEMAND (BUY)" if z['type'] == 'DEMAND' else "🟧 SUPPLY (SELL)"
-            snd_data.append([tipe, f"Rp {fmt(z['bot'])} - Rp {fmt(z['top'])}", z['time'].strftime('%H:%M %d/%m')])
-        st.table(pd.DataFrame(snd_data, columns=["Tipe Area", "Rentang Harga", "Waktu Terbentuk"]))
+        z_data = [[f"{'🟦 DEMAND' if z['type']=='DEMAND' else '🟧 SUPPLY'}", f"Rp {fmt(z['bot'])} - {fmt(z['top'])}", z['time'].strftime('%H:%M %d/%m')] for z in reversed(zones[-5:])]
+        st.table(pd.DataFrame(z_data, columns=["Tipe", "Rentang Harga", "Waktu"]))
     else:
-        st.info("Tidak ada zona Supply/Demand valid dekat harga saat ini.")
+        st.info("Tidak ada zona valid.")
         
-    # --- TABEL 2: HISTORI SINYAL (BACKTEST SIMPLE) ---
-    st.subheader("📊 Histori Sinyal (MACD + SnD Trigger)")
+    # --- TABEL 2: HISTORI SINYAL ---
+    st.subheader("📊 Histori Sinyal (Backtest)")
     if history:
-        # Reverse agar yang terbaru di atas
-        hist_df = pd.DataFrame(history).iloc[::-1]
-        
-        # Formatting Tampilan Tabel
-        def highlight_signal(val):
-            color = '#00e676' if 'BUY' in val else '#ff1744'
-            return f'color: {color}; font-weight: bold'
-            
-        st.dataframe(hist_df.style.map(highlight_signal, subset=['Tipe'])
-                     .format({"Harga Entry": "Rp {:,.0f}", "Stop Loss": "Rp {:,.0f}", "Take Profit": "Rp {:,.0f}"}),
-                     use_container_width=True)
+        h_df = pd.DataFrame(history).iloc[::-1]
+        h_df['Harga Entry'] = h_df['Entry'].apply(lambda x: f"Rp {fmt(x)}")
+        h_df['Stop Loss'] = h_df['SL'].apply(lambda x: f"Rp {fmt(x)}")
+        h_df['Take Profit'] = h_df['TP'].apply(lambda x: f"Rp {fmt(x)}")
+        h_df['Waktu'] = h_df['Waktu'].dt.strftime('%d/%m %H:%M')
+        st.dataframe(h_df[['Waktu', 'Tipe', 'Harga Entry', 'Stop Loss', 'Take Profit', 'Status']], use_container_width=True)
     else:
-        st.caption("Belum ada sinyal valid yang terdeteksi pada rentang data ini.")
+        st.caption("Belum ada sinyal di history data ini.")
 
-main_app(symbol, timeframe)
+dashboard(symbol, timeframe)
