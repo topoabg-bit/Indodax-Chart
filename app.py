@@ -66,6 +66,16 @@ def process_indicators(df):
                         (df['open'] < df['close'].shift(1))
     df['Bear_Engulf'] = (df['close'] < df['open']) & (df['close'] < df['open'].shift(1)) & \
                         (df['open'] > df['close'].shift(1))
+    
+    # --- TAMBAHAN BARU: INDIKATOR RSI (PENGAMAN PUCUK) ---
+    period = 14
+    delta = df['close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    df['RSI'] = 100 - (100 / (1 + rs))
+    # -----------------------------------------------------
+    
     return df
 
 def detect_zones(df):
@@ -105,18 +115,27 @@ def generate_signals(df, zones):
     
     for i in range(start, len(df)):
         row = df.iloc[i]
-        # BUY Logic
-        if row['MACD'] > row['Signal'] and (row['Bull_Engulf'] or row['Vol_Spike']):
+        
+        # PENGAMAN 1: JANGAN BELI JIKA RSI > 70 (PUCUK)
+        safe_to_buy = row['RSI'] < 70
+        
+        # PENGAMAN 2: JANGAN JUAL JIKA RSI < 30 (LEMBAH)
+        safe_to_sell = row['RSI'] > 30
+
+        # LOGIKA BUY (Ditambah 'and safe_to_buy')
+        if row['MACD'] > row['Signal'] and (row['Bull_Engulf'] or row['Vol_Spike']) and safe_to_buy:
             for z in zones:
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
+                    # PENGAMAN 3: HARGA WAJIB MASIH DI DALAM / DEKAT ZONA (ANTI KEJAR HARGA)
                     if row['low'] <= z['top']*1.005 and row['high'] >= z['bot']:
                         sl = z['bot'] - row['ATR']
                         tp = z['top'] + ((z['top'] - sl) * 2)
                         df.loc[df.index[i], 'sig_buy'] = True
                         history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
                         break
-        # SELL Logic
-        if row['MACD'] < row['Signal'] and (row['Bear_Engulf'] or row['Vol_Spike']):
+                        
+        # LOGIKA SELL (Ditambah 'and safe_to_sell')
+        if row['MACD'] < row['Signal'] and (row['Bear_Engulf'] or row['Vol_Spike']) and safe_to_sell:
             for z in zones:
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
                     if row['high'] >= z['bot']*0.995 and row['low'] <= z['top']:
