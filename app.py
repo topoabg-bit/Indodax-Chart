@@ -9,7 +9,7 @@ import pytz
 import requests
 
 # --- 1. KONFIGURASI ---
-st.set_page_config(layout="wide", page_title="Scalper V7: Final Fix")
+st.set_page_config(layout="wide", page_title="Scalper V8: RSI Guard")
 
 # --- 2. TELEGRAM SETTINGS ---
 def send_telegram(message):
@@ -43,21 +43,25 @@ def get_data(symbol, tf):
         st.error(f"Koneksi Error: {e}")
         return pd.DataFrame(), None
 
-# --- 4. INDIKATOR & LOGIC ---
+# --- 4. INDIKATOR (DITAMBAH RSI) ---
 def process_indicators(df):
     if df.empty: return df
+    
     # Trend
     df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
+    
     # MACD
     ema12 = df['close'].ewm(span=12, adjust=False).mean()
     ema26 = df['close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema12 - ema26
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['Hist'] = df['MACD'] - df['Signal']
+    
     # ATR
     df['tr'] = np.maximum(df['high'] - df['low'], 
                np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
     df['ATR'] = df['tr'].ewm(span=14).mean()
+    
     # Volume & Candle
     df['Vol_MA'] = df['volume'].rolling(20).mean()
     df['Vol_Spike'] = df['volume'] > df['Vol_MA']
@@ -66,18 +70,18 @@ def process_indicators(df):
                         (df['open'] < df['close'].shift(1))
     df['Bear_Engulf'] = (df['close'] < df['open']) & (df['close'] < df['open'].shift(1)) & \
                         (df['open'] > df['close'].shift(1))
-    
-    # --- TAMBAHAN BARU: INDIKATOR RSI (PENGAMAN PUCUK) ---
+                        
+    # --- RSI CALCULATION (BARU) ---
     period = 14
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
-    # -----------------------------------------------------
     
     return df
 
+# --- 5. DETEKSI SUPPLY DEMAND ---
 def detect_zones(df):
     zones = []
     vol_ma = df['volume'].rolling(20).mean()
@@ -107,6 +111,7 @@ def detect_zones(df):
             if not (future['close'] > z['top']).any(): active.append(z)
     return active
 
+# --- 6. LOGIKA SINYAL (DITAMBAH RSI FILTER) ---
 def generate_signals(df, zones):
     history = []
     df['sig_buy'] = False
@@ -116,17 +121,14 @@ def generate_signals(df, zones):
     for i in range(start, len(df)):
         row = df.iloc[i]
         
-        # PENGAMAN 1: JANGAN BELI JIKA RSI > 70 (PUCUK)
-        safe_to_buy = row['RSI'] < 70
+        # --- RSI FILTER ---
+        safe_buy = row['RSI'] < 70  # Jangan Buy jika Overbought
+        safe_sell = row['RSI'] > 30 # Jangan Sell jika Oversold
         
-        # PENGAMAN 2: JANGAN JUAL JIKA RSI < 30 (LEMBAH)
-        safe_to_sell = row['RSI'] > 30
-
-        # LOGIKA BUY (Ditambah 'and safe_to_buy')
-        if row['MACD'] > row['Signal'] and (row['Bull_Engulf'] or row['Vol_Spike']) and safe_to_buy:
+        # LOGIKA BUY
+        if row['MACD'] > row['Signal'] and (row['Bull_Engulf'] or row['Vol_Spike']) and safe_buy:
             for z in zones:
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
-                    # PENGAMAN 3: HARGA WAJIB MASIH DI DALAM / DEKAT ZONA (ANTI KEJAR HARGA)
                     if row['low'] <= z['top']*1.005 and row['high'] >= z['bot']:
                         sl = z['bot'] - row['ATR']
                         tp = z['top'] + ((z['top'] - sl) * 2)
@@ -134,8 +136,8 @@ def generate_signals(df, zones):
                         history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
                         break
                         
-        # LOGIKA SELL (Ditambah 'and safe_to_sell')
-        if row['MACD'] < row['Signal'] and (row['Bear_Engulf'] or row['Vol_Spike']) and safe_to_sell:
+        # LOGIKA SELL
+        if row['MACD'] < row['Signal'] and (row['Bear_Engulf'] or row['Vol_Spike']) and safe_sell:
             for z in zones:
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
                     if row['high'] >= z['bot']*0.995 and row['low'] <= z['top']:
@@ -146,11 +148,11 @@ def generate_signals(df, zones):
                         break
     return df, history
 
-# --- 5. MAIN DASHBOARD ---
+# --- 7. DASHBOARD VISUAL ---
 st.sidebar.header("🎛️ Scalper Controller")
 symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['1m', '15m', '30m', '1h', '4h', '1d'])
-st.title(f"Scalping Pro: {symbol} ({timeframe})")
+st.title(f"Scalping Pro V8: {symbol} ({timeframe})")
 
 @st.fragment(run_every=60)
 def dashboard(sym, tf):
@@ -166,6 +168,7 @@ def dashboard(sym, tf):
     high24 = float(ticker['high'])
     low24 = float(ticker['low'])
     atr = df['ATR'].iloc[-1]
+    rsi_val = df['RSI'].iloc[-1] # Ambil nilai RSI
     ema200 = df['EMA_200'].iloc[-1]
     
     # --- NOTIFICATION LOGIC ---
@@ -179,7 +182,7 @@ def dashboard(sym, tf):
     if history:
         last_sig = history[-1]
         if last_sig['Waktu'] == df['timestamp'].iloc[-1]:
-            # Cek Notifikasi Baru
+            
             is_new = False
             if st.session_state['last_alert_time'] != last_sig['Waktu']:
                 is_new = True
@@ -206,7 +209,7 @@ def dashboard(sym, tf):
     # Helper
     def fmt(x): return f"{x:,.0f}".replace(",", ".")
 
-    # --- HTML LAYOUT ---
+    # --- LAYOUT (DITAMBAH TAMPILAN RSI) ---
     st.markdown(f"""
     <style>
         .row-1 {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
@@ -230,7 +233,7 @@ def dashboard(sym, tf):
         <div class="box" style="border-top: 3px solid #29b6f6"><div class="lbl">ENTRY PLAN</div><div class="val" style="color:#29b6f6">{entry_plan}</div></div>
         <div class="box" style="border-top: 3px solid #00e676"><div class="lbl">TAKE PROFIT</div><div class="val" style="color:#00e676">{tp_plan}</div></div>
         <div class="box" style="border-top: 3px solid #ff1744"><div class="lbl">STOP LOSS</div><div class="val" style="color:#ff1744">{sl_plan}</div></div>
-        <div class="box"><div class="lbl">VOLATILITY</div><div class="val">{fmt(atr)}</div></div>
+        <div class="box"><div class="lbl">VOLATILITY / RSI</div><div class="val">{fmt(atr)} / <span style="color:{'#ff1744' if rsi_val > 70 else '#00e676' if rsi_val < 30 else 'white'}">{rsi_val:.0f}</span></div></div>
         <div class="box"><div class="lbl">TREND</div><div class="val" style="color:{'#00e676' if curr > ema200 else '#ff1744'}">{'BULL' if curr > ema200 else 'BEAR'}</div></div>
     </div>
     """, unsafe_allow_html=True)
@@ -269,10 +272,7 @@ def dashboard(sym, tf):
         st.subheader("📊 Histori Sinyal (100 Candle Terakhir)")
         if history:
             h_df = pd.DataFrame(history).iloc[::-1]
-            
-            # --- FIX FORMAT WAKTU & HARGA DISINI ---
-            h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M (%d/%m)') # Hanya Jam:Menit (Tgl/Bln)
-            
+            h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M (%d/%m)') 
             h_df['Harga Entry'] = h_df['Entry'].apply(lambda x: f"Rp {fmt(x)}")
             h_df['Stop Loss'] = h_df['SL'].apply(lambda x: f"Rp {fmt(x)}")
             h_df['Take Profit'] = h_df['TP'].apply(lambda x: f"Rp {fmt(x)}")
