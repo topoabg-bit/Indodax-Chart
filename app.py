@@ -116,33 +116,36 @@ def generate_signals(df, zones):
     history = []
     df['sig_buy'] = False
     df['sig_sell'] = False
-    start = max(1, len(df) - 100) # Mulai dari 1 untuk cek i-1
+    start = max(1, len(df) - 100)
     
     for i in range(start, len(df)):
         row = df.iloc[i]
-        prev_row = df.iloc[i-1] # Ambil candle sebelumnya
+        prev_row = df.iloc[i-1]
         
         # --- FILTER RSI ---
         safe_buy = row['RSI'] < 75
         safe_sell = row['RSI'] > 25
         
-        # --- POLA CANDLE ---
-        is_hammer = (row['close'] > row['open']) and \
-                    ((row['open'] - row['low']) > 2 * (row['close'] - row['open']))
-        is_shooting_star = (row['open'] > row['close']) and \
-                           ((row['high'] - row['open']) > 2 * (row['open'] - row['close']))
-                           
-        # --- POLA MACD (BARU) ---
+        # --- DEFINISI TRIGGER ---
+        # Pola Candle
+        is_hammer = (row['close'] > row['open']) and ((row['open'] - row['low']) > 2 * (row['close'] - row['open']))
+        is_shooting_star = (row['open'] > row['close']) and ((row['high'] - row['open']) > 2 * (row['open'] - row['close']))
+        
+        # Pola MACD (Crossover)
         macd_cross_buy = (prev_row['MACD'] < prev_row['Signal']) and (row['MACD'] > row['Signal'])
         macd_cross_sell = (prev_row['MACD'] > prev_row['Signal']) and (row['MACD'] < row['Signal'])
         
-        # --- TRIGGER GABUNGAN ---
-        # Masukkan 'macd_cross' ke sini
-        trigger_buy = row['Bull_Engulf'] or row['Vol_Spike'] or is_hammer or macd_cross_buy
-        trigger_sell = row['Bear_Engulf'] or row['Vol_Spike'] or is_shooting_star or macd_cross_sell
+        # Trigger Gabungan
+        trigger_buy_zone = row['Bull_Engulf'] or row['Vol_Spike'] or is_hammer or macd_cross_buy
+        trigger_sell_zone = row['Bear_Engulf'] or row['Vol_Spike'] or is_shooting_star or macd_cross_sell
 
-        # LOGIKA BUY
-        if row['MACD'] > row['Signal'] and trigger_buy and safe_buy:
+        # Flag untuk mengecek apakah sinyal zona sudah terambil
+        zone_signal_taken = False
+
+        # =========================================
+        # STRATEGI 1: ZONE BASED (Konservatif & Akurat)
+        # =========================================
+        if row['MACD'] > row['Signal'] and trigger_buy_zone and safe_buy:
             for z in zones:
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
                     if row['low'] <= z['top']*1.015 and row['high'] >= z['bot']:
@@ -150,16 +153,11 @@ def generate_signals(df, zones):
                         tp = z['top'] + ((z['top'] - sl) * 1.5)
                         
                         df.loc[df.index[i], 'sig_buy'] = True
-                        history.append({
-                            'Waktu': row['timestamp'], 
-                            'Tipe': 'BUY (Cross/Pola)', 
-                            'Entry': row['close'], 
-                            'SL': sl, 'TP': tp, 'Status': 'Aktif'
-                        })
+                        history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY (Zone)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
+                        zone_signal_taken = True # Tandai sudah ambil sinyal
                         break
-                        
-        # LOGIKA SELL
-        if row['MACD'] < row['Signal'] and trigger_sell and safe_sell:
+        
+        if row['MACD'] < row['Signal'] and trigger_sell_zone and safe_sell:
             for z in zones:
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
                     if row['high'] >= z['bot']*0.985 and row['low'] <= z['top']:
@@ -167,13 +165,34 @@ def generate_signals(df, zones):
                         tp = z['bot'] - ((sl - z['bot']) * 1.5)
                         
                         df.loc[df.index[i], 'sig_sell'] = True
-                        history.append({
-                            'Waktu': row['timestamp'], 
-                            'Tipe': 'SELL (Cross/Pola)', 
-                            'Entry': row['close'], 
-                            'SL': sl, 'TP': tp, 'Status': 'Aktif'
-                        })
+                        history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL (Zone)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
+                        zone_signal_taken = True
                         break
+
+        # =========================================
+        # STRATEGI 2: MOMENTUM ONLY (Agresif - Backup)
+        # Hanya jalan jika Trigger = MACD CROSS & Tidak ada sinyal Zona
+        # =========================================
+        if not zone_signal_taken:
+            
+            # LOGIKA BUY MOMENTUM (Tanpa Zona)
+            if macd_cross_buy and safe_buy:
+                # Karena tidak ada zona, SL pakai Swing Low terdekat (Low Candle - 1.5 ATR)
+                sl = row['low'] - (row['ATR'] * 1.5)
+                risk = row['close'] - sl
+                tp = row['close'] + (risk * 1.5) # Tetap jaga RR 1:1.5
+                
+                df.loc[df.index[i], 'sig_buy'] = True
+                history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY (Momtm)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
+
+            # LOGIKA SELL MOMENTUM (Tanpa Zona)
+            elif macd_cross_sell and safe_sell:
+                sl = row['high'] + (row['ATR'] * 1.5)
+                risk = sl - row['close']
+                tp = row['close'] - (risk * 1.5)
+                
+                df.loc[df.index[i], 'sig_sell'] = True
+                history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL (Momtm)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
                         
     return df, history
 
