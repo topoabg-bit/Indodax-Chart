@@ -116,70 +116,62 @@ def generate_signals(df, zones):
     history = []
     df['sig_buy'] = False
     df['sig_sell'] = False
-    # Analisa 100 data terakhir saja biar ringan
-    start = max(0, len(df) - 100)
+    start = max(1, len(df) - 100) # Mulai dari 1 untuk cek i-1
     
     for i in range(start, len(df)):
         row = df.iloc[i]
+        prev_row = df.iloc[i-1] # Ambil candle sebelumnya
         
-        # --- FILTER RSI (Agar tidak beli di pucuk) ---
-        safe_buy = row['RSI'] < 75   # Sedikit dilonggarkan dari 70 ke 75
-        safe_sell = row['RSI'] > 25  # Sedikit dilonggarkan dari 30 ke 25
+        # --- FILTER RSI ---
+        safe_buy = row['RSI'] < 75
+        safe_sell = row['RSI'] > 25
         
-        # --- DEFINISI POLA CANDLE (Lebih Sensitif) ---
-        # 1. Hammer: Ekor bawah panjang (Tanda tolak turun)
+        # --- POLA CANDLE ---
         is_hammer = (row['close'] > row['open']) and \
                     ((row['open'] - row['low']) > 2 * (row['close'] - row['open']))
-                    
-        # 2. Shooting Star: Ekor atas panjang (Tanda tolak naik)
         is_shooting_star = (row['open'] > row['close']) and \
                            ((row['high'] - row['open']) > 2 * (row['open'] - row['close']))
+                           
+        # --- POLA MACD (BARU) ---
+        macd_cross_buy = (prev_row['MACD'] < prev_row['Signal']) and (row['MACD'] > row['Signal'])
+        macd_cross_sell = (prev_row['MACD'] > prev_row['Signal']) and (row['MACD'] < row['Signal'])
         
-        # 3. Trigger Gabungan (Engulfing ATAU Volume ATAU Pola Baru)
-        trigger_buy = row['Bull_Engulf'] or row['Vol_Spike'] or is_hammer
-        trigger_sell = row['Bear_Engulf'] or row['Vol_Spike'] or is_shooting_star
+        # --- TRIGGER GABUNGAN ---
+        # Masukkan 'macd_cross' ke sini
+        trigger_buy = row['Bull_Engulf'] or row['Vol_Spike'] or is_hammer or macd_cross_buy
+        trigger_sell = row['Bear_Engulf'] or row['Vol_Spike'] or is_shooting_star or macd_cross_sell
 
-        # --- LOGIKA BUY ---
+        # LOGIKA BUY
         if row['MACD'] > row['Signal'] and trigger_buy and safe_buy:
             for z in zones:
-                # Hanya cek zona DEMAND yang terbentuk sebelum candle saat ini
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
-                    
-                    # Toleransi Diperlebar ke 1.5% (1.015)
                     if row['low'] <= z['top']*1.015 and row['high'] >= z['bot']:
                         sl = z['bot'] - row['ATR']
-                        tp = z['top'] + ((z['top'] - sl) * 1.5) # Target 1.5x Resiko
+                        tp = z['top'] + ((z['top'] - sl) * 1.5)
                         
                         df.loc[df.index[i], 'sig_buy'] = True
                         history.append({
                             'Waktu': row['timestamp'], 
-                            'Tipe': 'BUY (Wide)', 
+                            'Tipe': 'BUY (Cross/Pola)', 
                             'Entry': row['close'], 
-                            'SL': sl, 
-                            'TP': tp, 
-                            'Status': 'Aktif'
+                            'SL': sl, 'TP': tp, 'Status': 'Aktif'
                         })
                         break
                         
-        # --- LOGIKA SELL ---
+        # LOGIKA SELL
         if row['MACD'] < row['Signal'] and trigger_sell and safe_sell:
             for z in zones:
-                # Hanya cek zona SUPPLY
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
-                    
-                    # Toleransi Diperlebar ke 1.5% (0.985)
                     if row['high'] >= z['bot']*0.985 and row['low'] <= z['top']:
                         sl = z['top'] + row['ATR']
-                        tp = z['bot'] - ((sl - z['bot']) * 1.5) # Target 1.5x Resiko
+                        tp = z['bot'] - ((sl - z['bot']) * 1.5)
                         
                         df.loc[df.index[i], 'sig_sell'] = True
                         history.append({
                             'Waktu': row['timestamp'], 
-                            'Tipe': 'SELL (Wide)', 
+                            'Tipe': 'SELL (Cross/Pola)', 
                             'Entry': row['close'], 
-                            'SL': sl, 
-                            'TP': tp, 
-                            'Status': 'Aktif'
+                            'SL': sl, 'TP': tp, 'Status': 'Aktif'
                         })
                         break
                         
