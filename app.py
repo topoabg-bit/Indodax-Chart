@@ -145,6 +145,7 @@ def generate_signals(df, zones):
         # =========================================
         # STRATEGI 1: ZONE BASED (Konservatif & Akurat)
         # =========================================
+        # LOGIKA BUY DALAM ZONA
         if row['MACD'] > row['Signal'] and trigger_buy_zone and safe_buy:
             for z in zones:
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
@@ -156,7 +157,8 @@ def generate_signals(df, zones):
                         history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY (Zone)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
                         zone_signal_taken = True # Tandai sudah ambil sinyal
                         break
-        
+
+        # LOGIKA SELL DALAM ZONA
         if row['MACD'] < row['Signal'] and trigger_sell_zone and safe_sell:
             for z in zones:
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
