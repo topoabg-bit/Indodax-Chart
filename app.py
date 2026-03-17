@@ -19,7 +19,7 @@ def send_telegram(message):
     CHAT_ID = "8107526630"
     # ==========================================
     
-    if BOT_TOKEN == "7992906337:AAGPstFckZsaMmabZDA6m_EauP-aTqQxlZQ":
+    if BOT_TOKEN == "TOKEN_BOT_ANDA_DISINI":
         return 
         
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
