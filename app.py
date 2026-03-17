@@ -111,41 +111,78 @@ def detect_zones(df):
             if not (future['close'] > z['top']).any(): active.append(z)
     return active
 
-# --- 6. LOGIKA SINYAL (DITAMBAH RSI FILTER) ---
+# --- 6. LOGIKA SINYAL (FULL VERSION: BUY & SELL UPDATE) ---
 def generate_signals(df, zones):
     history = []
     df['sig_buy'] = False
     df['sig_sell'] = False
+    # Analisa 100 data terakhir saja biar ringan
     start = max(0, len(df) - 100)
     
     for i in range(start, len(df)):
         row = df.iloc[i]
         
-        # --- RSI FILTER ---
-        safe_buy = row['RSI'] < 70  # Jangan Buy jika Overbought
-        safe_sell = row['RSI'] > 30 # Jangan Sell jika Oversold
+        # --- FILTER RSI (Agar tidak beli di pucuk) ---
+        safe_buy = row['RSI'] < 75   # Sedikit dilonggarkan dari 70 ke 75
+        safe_sell = row['RSI'] > 25  # Sedikit dilonggarkan dari 30 ke 25
         
-        # LOGIKA BUY
-        if row['MACD'] > row['Signal'] and (row['Bull_Engulf'] or row['Vol_Spike']) and safe_buy:
+        # --- DEFINISI POLA CANDLE (Lebih Sensitif) ---
+        # 1. Hammer: Ekor bawah panjang (Tanda tolak turun)
+        is_hammer = (row['close'] > row['open']) and \
+                    ((row['open'] - row['low']) > 2 * (row['close'] - row['open']))
+                    
+        # 2. Shooting Star: Ekor atas panjang (Tanda tolak naik)
+        is_shooting_star = (row['open'] > row['close']) and \
+                           ((row['high'] - row['open']) > 2 * (row['open'] - row['close']))
+        
+        # 3. Trigger Gabungan (Engulfing ATAU Volume ATAU Pola Baru)
+        trigger_buy = row['Bull_Engulf'] or row['Vol_Spike'] or is_hammer
+        trigger_sell = row['Bear_Engulf'] or row['Vol_Spike'] or is_shooting_star
+
+        # --- LOGIKA BUY ---
+        if row['MACD'] > row['Signal'] and trigger_buy and safe_buy:
             for z in zones:
+                # Hanya cek zona DEMAND yang terbentuk sebelum candle saat ini
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
-                    if row['low'] <= z['top']*1.005 and row['high'] >= z['bot']:
+                    
+                    # Toleransi Diperlebar ke 1.5% (1.015)
+                    if row['low'] <= z['top']*1.015 and row['high'] >= z['bot']:
                         sl = z['bot'] - row['ATR']
-                        tp = z['top'] + ((z['top'] - sl) * 2)
+                        tp = z['top'] + ((z['top'] - sl) * 1.5) # Target 1.5x Resiko
+                        
                         df.loc[df.index[i], 'sig_buy'] = True
-                        history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
+                        history.append({
+                            'Waktu': row['timestamp'], 
+                            'Tipe': 'BUY (Wide)', 
+                            'Entry': row['close'], 
+                            'SL': sl, 
+                            'TP': tp, 
+                            'Status': 'Aktif'
+                        })
                         break
                         
-        # LOGIKA SELL
-        if row['MACD'] < row['Signal'] and (row['Bear_Engulf'] or row['Vol_Spike']) and safe_sell:
+        # --- LOGIKA SELL ---
+        if row['MACD'] < row['Signal'] and trigger_sell and safe_sell:
             for z in zones:
+                # Hanya cek zona SUPPLY
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
-                    if row['high'] >= z['bot']*0.995 and row['low'] <= z['top']:
+                    
+                    # Toleransi Diperlebar ke 1.5% (0.985)
+                    if row['high'] >= z['bot']*0.985 and row['low'] <= z['top']:
                         sl = z['top'] + row['ATR']
-                        tp = z['bot'] - ((sl - z['bot']) * 2)
+                        tp = z['bot'] - ((sl - z['bot']) * 1.5) # Target 1.5x Resiko
+                        
                         df.loc[df.index[i], 'sig_sell'] = True
-                        history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
+                        history.append({
+                            'Waktu': row['timestamp'], 
+                            'Tipe': 'SELL (Wide)', 
+                            'Entry': row['close'], 
+                            'SL': sl, 
+                            'TP': tp, 
+                            'Status': 'Aktif'
+                        })
                         break
+                        
     return df, history
 
 # --- 7. DASHBOARD VISUAL ---
