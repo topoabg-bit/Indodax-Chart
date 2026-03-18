@@ -8,61 +8,70 @@ from datetime import datetime, timedelta
 import pytz
 import requests
 
-# --- 1. KONFIGURASI ---
-st.set_page_config(layout="wide", page_title="Scalper V8: RSI Guard")
+# ==========================================
+# --- 1. KONFIGURASI & SETUP ---
+# ==========================================
+st.set_page_config(layout="wide", page_title="Indodax Scalper V8.1: Fee Guard")
 
-# --- 2. TELEGRAM SETTINGS ---
+# --- TELEGRAM SETTINGS (ISI DISINI) ---
 def send_telegram(message):
-    # ==========================================
-    # ISI TOKEN & CHAT ID ANDA DI BAWAH INI:
-    BOT_TOKEN = "7992906337:AAGPstFckZsaMmabZDA6m_EauP-aTqQxlZQ"
-    CHAT_ID = "8107526630"
-    # ==========================================
+    # GANTI DENGAN TOKEN & CHAT ID ANDA
+    BOT_TOKEN = "TOKEN_BOT_ANDA_DISINI" 
+    CHAT_ID = "CHAT_ID_ANDA_DISINI"
     
-    if BOT_TOKEN == "TOKEN_BOT_ANDA_DISINI":
+    # Skip jika token belum diisi
+    if "TOKEN_BOT" in BOT_TOKEN:
         return 
         
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     params = {'chat_id': CHAT_ID, 'text': message, 'parse_mode': 'Markdown'}
     try:
         requests.get(url, params=params, timeout=3)
-    except:
-        pass
+    except Exception as e:
+        print(f"Telegram Error: {e}")
 
-# --- 3. DATA ENGINE ---
+# ==========================================
+# --- 2. DATA ENGINE (CCXT INDODAX) ---
+# ==========================================
 def get_data(symbol, tf):
     exchange = ccxt.indodax()
     try:
+        # Mengambil 500 candle terakhir
         ohlcv = exchange.fetch_ohlcv(symbol, tf, limit=500)
         if not ohlcv: return pd.DataFrame(), None
+        
         df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Konversi waktu ke WIB (Asia/Jakarta)
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms').dt.tz_localize('UTC').dt.tz_convert('Asia/Jakarta')
+        
         ticker = exchange.fetch_ticker(symbol)
         return df, ticker
     except Exception as e:
-        st.error(f"Koneksi Error: {e}")
+        st.error(f"Koneksi Indodax Error: {e}")
         return pd.DataFrame(), None
 
-# --- 4. INDIKATOR (DITAMBAH RSI) ---
+# ==========================================
+# --- 3. INDIKATOR TEKNIKAL ---
+# ==========================================
 def process_indicators(df):
     if df.empty: return df
     
-    # Trend
+    # 1. Trend Filter (EMA 200)
     df['EMA_200'] = df['close'].ewm(span=200, adjust=False).mean()
     
-    # MACD
+    # 2. Momentum (MACD)
     ema12 = df['close'].ewm(span=12, adjust=False).mean()
     ema26 = df['close'].ewm(span=26, adjust=False).mean()
     df['MACD'] = ema12 - ema26
     df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
     df['Hist'] = df['MACD'] - df['Signal']
     
-    # ATR
+    # 3. Volatilitas (ATR)
     df['tr'] = np.maximum(df['high'] - df['low'], 
                np.maximum(abs(df['high'] - df['close'].shift()), abs(df['low'] - df['close'].shift())))
     df['ATR'] = df['tr'].ewm(span=14).mean()
     
-    # Volume & Candle
+    # 4. Volume & Pola Candle
     df['Vol_MA'] = df['volume'].rolling(20).mean()
     df['Vol_Spike'] = df['volume'] > df['Vol_MA']
     
@@ -71,7 +80,7 @@ def process_indicators(df):
     df['Bear_Engulf'] = (df['close'] < df['open']) & (df['close'] < df['open'].shift(1)) & \
                         (df['open'] > df['close'].shift(1))
                         
-    # --- RSI CALCULATION (BARU) ---
+    # 5. RSI Calculation
     period = 14
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -81,17 +90,21 @@ def process_indicators(df):
     
     return df
 
-# --- 5. DETEKSI SUPPLY DEMAND ---
+# ==========================================
+# --- 4. DETEKSI SUPPLY & DEMAND (FIXED) ---
+# ==========================================
 def detect_zones(df):
     zones = []
     vol_ma = df['volume'].rolling(20).mean()
     body = (df['close'] - df['open']).abs()
     avg_body = body.rolling(20).mean()
     
-    start = max(0, len(df) - 150)
+    start = max(0, len(df) - 200) # Scan 200 candle terakhir
     for i in range(start, len(df)-2):
         curr = df.iloc[i]
         prev = df.iloc[i-1]
+        
+        # Syarat Zona: Candle Impulsif (Body besar + Volume besar)
         is_impulse = (curr['volume'] > vol_ma.iloc[i]) and (body.iloc[i] > avg_body.iloc[i])
         
         if is_impulse and curr['close'] > curr['open'] and prev['close'] < prev['open']:
@@ -101,17 +114,25 @@ def detect_zones(df):
             zones.append({'type': 'SUPPLY', 'top': prev['high'], 'bot': prev['low'], 'time': prev['timestamp'],
                           'color': 'rgba(255, 167, 38, 0.3)', 'line': 'rgba(255, 167, 38, 0.8)'})
             
+    # --- VALIDASI ZONA (FIXED V8.1) ---
     active = []
     for z in zones:
         future = df[df['timestamp'] > z['time']]
-        if future.empty: active.append(z)
+        if future.empty:
+            active.append(z)
         elif z['type'] == 'DEMAND':
-            if not (future['close'] < z['bot']).any(): active.append(z)
+            # FIX: Gunakan 'low' agar zona hangus jika ekor tembus bawah
+            if not (future['low'] < z['bot']).any(): 
+                active.append(z)
         else:
-            if not (future['close'] > z['top']).any(): active.append(z)
+            # FIX: Gunakan 'high' agar zona hangus jika ekor tembus atas
+            if not (future['high'] > z['top']).any(): 
+                active.append(z)
     return active
 
-# --- 6. LOGIKA SINYAL (FULL VERSION: BUY & SELL UPDATE) ---
+# ==========================================
+# --- 5. LOGIKA SINYAL (FEE GUARD) ---
+# ==========================================
 def generate_signals(df, zones):
     history = []
     df['sig_buy'] = False
@@ -122,43 +143,43 @@ def generate_signals(df, zones):
         row = df.iloc[i]
         prev_row = df.iloc[i-1]
         
-        # --- FILTER RSI ---
-        safe_buy = row['RSI'] < 75
-        safe_sell = row['RSI'] > 25
+        # --- PARAMETER ---
+        safe_buy = row['RSI'] < 70  # Jangan beli di pucuk
+        safe_sell = row['RSI'] > 30 # Jangan jual di dasar
+        min_profit_percent = 0.008  # WAJIB 0.8% untuk cover fee Indodax (0.6%)
         
-        # --- DEFINISI TRIGGER ---
         # Pola Candle
         is_hammer = (row['close'] > row['open']) and ((row['open'] - row['low']) > 2 * (row['close'] - row['open']))
         is_shooting_star = (row['open'] > row['close']) and ((row['high'] - row['open']) > 2 * (row['open'] - row['close']))
         
-        # Pola MACD (Crossover)
+        # Trigger Gabungan
+        trigger_buy_zone = row['Bull_Engulf'] or row['Vol_Spike'] or is_hammer
+        trigger_sell_zone = row['Bear_Engulf'] or row['Vol_Spike'] or is_shooting_star
+        
+        # MACD Cross
         macd_cross_buy = (prev_row['MACD'] < prev_row['Signal']) and (row['MACD'] > row['Signal'])
         macd_cross_sell = (prev_row['MACD'] > prev_row['Signal']) and (row['MACD'] < row['Signal'])
-        
-        # Trigger Gabungan
-        trigger_buy_zone = row['Bull_Engulf'] or row['Vol_Spike'] or is_hammer or macd_cross_buy
-        trigger_sell_zone = row['Bear_Engulf'] or row['Vol_Spike'] or is_shooting_star or macd_cross_sell
 
-        # Flag untuk mengecek apakah sinyal zona sudah terambil
         zone_signal_taken = False
+        entry_price = row['close']
+        tp, sl = 0, 0
 
-        # =========================================
-        # STRATEGI 1: ZONE BASED (Konservatif & Akurat)
-        # =========================================
-        # LOGIKA BUY DALAM ZONA
+        # --- STRATEGI 1: ZONE BASED ---
         if row['MACD'] > row['Signal'] and trigger_buy_zone and safe_buy:
             for z in zones:
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
+                    # Harga mantul di area Demand
                     if row['low'] <= z['top']*1.015 and row['high'] >= z['bot']:
                         sl = z['bot'] - row['ATR']
-                        tp = z['top'] + ((z['top'] - sl) * 1.5)
+                        tp = z['top'] + ((z['top'] - sl) * 1.5) # RR 1:1.5
                         
-                        df.loc[df.index[i], 'sig_buy'] = True
-                        history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY (Zone)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
-                        zone_signal_taken = True # Tandai sudah ambil sinyal
+                        # --- FEE GUARD CHECK ---
+                        if (tp - entry_price) / entry_price > min_profit_percent:
+                            df.loc[df.index[i], 'sig_buy'] = True
+                            history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY (Zone)', 'Entry': entry_price, 'SL': sl, 'TP': tp, 'Status': 'Active'})
+                            zone_signal_taken = True
                         break
 
-        # LOGIKA SELL DALAM ZONA
         if row['MACD'] < row['Signal'] and trigger_sell_zone and safe_sell:
             for z in zones:
                 if z['type'] == 'SUPPLY' and z['time'] < row['timestamp']:
@@ -166,44 +187,44 @@ def generate_signals(df, zones):
                         sl = z['top'] + row['ATR']
                         tp = z['bot'] - ((sl - z['bot']) * 1.5)
                         
-                        df.loc[df.index[i], 'sig_sell'] = True
-                        history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL (Zone)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
-                        zone_signal_taken = True
+                        # --- FEE GUARD CHECK ---
+                        if (entry_price - tp) / entry_price > min_profit_percent:
+                            df.loc[df.index[i], 'sig_sell'] = True
+                            history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL (Zone)', 'Entry': entry_price, 'SL': sl, 'TP': tp, 'Status': 'Active'})
+                            zone_signal_taken = True
                         break
 
-        # =========================================
-        # STRATEGI 2: MOMENTUM ONLY (Agresif - Backup)
-        # Hanya jalan jika Trigger = MACD CROSS & Tidak ada sinyal Zona
-        # =========================================
+        # --- STRATEGI 2: MOMENTUM ONLY ---
         if not zone_signal_taken:
-            
-            # LOGIKA BUY MOMENTUM (Tanpa Zona)
             if macd_cross_buy and safe_buy:
-                # Karena tidak ada zona, SL pakai Swing Low terdekat (Low Candle - 1.5 ATR)
                 sl = row['low'] - (row['ATR'] * 1.5)
-                risk = row['close'] - sl
-                tp = row['close'] + (risk * 1.5) # Tetap jaga RR 1:1.5
+                risk = entry_price - sl
+                tp = entry_price + (risk * 1.5)
                 
-                df.loc[df.index[i], 'sig_buy'] = True
-                history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY (Momtm)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
+                if (tp - entry_price) / entry_price > min_profit_percent:
+                    df.loc[df.index[i], 'sig_buy'] = True
+                    history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY (Momtm)', 'Entry': entry_price, 'SL': sl, 'TP': tp, 'Status': 'Active'})
 
-            # LOGIKA SELL MOMENTUM (Tanpa Zona)
             elif macd_cross_sell and safe_sell:
                 sl = row['high'] + (row['ATR'] * 1.5)
-                risk = sl - row['close']
-                tp = row['close'] - (risk * 1.5)
+                risk = sl - entry_price
+                tp = entry_price - (risk * 1.5)
                 
-                df.loc[df.index[i], 'sig_sell'] = True
-                history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL (Momtm)', 'Entry': row['close'], 'SL': sl, 'TP': tp, 'Status': 'Aktif'})
+                if (entry_price - tp) / entry_price > min_profit_percent:
+                    df.loc[df.index[i], 'sig_sell'] = True
+                    history.append({'Waktu': row['timestamp'], 'Tipe': 'SELL (Momtm)', 'Entry': entry_price, 'SL': sl, 'TP': tp, 'Status': 'Active'})
                         
     return df, history
 
-# --- 7. DASHBOARD VISUAL ---
-st.sidebar.header("🎛️ Scalper Controller")
-symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR'])
+# ==========================================
+# --- 6. DASHBOARD & VISUALISASI ---
+# ==========================================
+st.sidebar.header("🎛️ Indodax Scalper V8.1")
+symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR', 'USDT/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['1m', '15m', '30m', '1h', '4h', '1d'])
-st.title(f"Scalping Pro V8: {symbol} ({timeframe})")
+st.title(f"Scalper Pro: {symbol} ({timeframe})")
 
+# Auto-refresh setiap 60 detik
 @st.fragment(run_every=60)
 def dashboard(sym, tf):
     df, ticker = get_data(sym, tf)
@@ -212,16 +233,16 @@ def dashboard(sym, tf):
     zones = detect_zones(df)
     df, history = generate_signals(df, zones)
     
-    # Realtime Vars
+    # Variabel Realtime
     curr = float(ticker['last'])
     vol = float(ticker['baseVolume'])
     high24 = float(ticker['high'])
     low24 = float(ticker['low'])
     atr = df['ATR'].iloc[-1]
-    rsi_val = df['RSI'].iloc[-1] # Ambil nilai RSI
+    rsi_val = df['RSI'].iloc[-1]
     ema200 = df['EMA_200'].iloc[-1]
     
-    # --- NOTIFICATION LOGIC ---
+    # --- LOGIKA NOTIFIKASI (FIXED) ---
     if 'last_alert_time' not in st.session_state:
         st.session_state['last_alert_time'] = None
 
@@ -231,6 +252,7 @@ def dashboard(sym, tf):
     
     if history:
         last_sig = history[-1]
+        # Cek apakah sinyal terjadi di candle terakhir
         if last_sig['Waktu'] == df['timestamp'].iloc[-1]:
             
             is_new = False
@@ -238,12 +260,13 @@ def dashboard(sym, tf):
                 is_new = True
                 st.session_state['last_alert_time'] = last_sig['Waktu']
             
-            if last_sig['Tipe'] == 'BUY':
-                status_txt = "BUY SIGNAL"
+            # FIX: Menggunakan 'in' untuk string matching yang aman
+            if 'BUY' in last_sig['Tipe']:
+                status_txt = f"{last_sig['Tipe']}"
                 sig_col = "#00e676"
                 msg_head = "🟢 *BUY SIGNAL!*"
-            else:
-                status_txt = "SELL SIGNAL"
+            elif 'SELL' in last_sig['Tipe']:
+                status_txt = f"{last_sig['Tipe']}"
                 sig_col = "#ff1744"
                 msg_head = "🔴 *SELL SIGNAL!*"
                 
@@ -252,14 +275,14 @@ def dashboard(sym, tf):
             sl_plan = f"Rp {last_sig['SL']:,.0f}"
             
             if is_new:
-                msg = f"{msg_head}\nAsset: {sym} ({tf})\nPrice: {entry_plan}\nTP: {tp_plan}\nSL: {sl_plan}\nTime: {last_sig['Waktu'].strftime('%H:%M')}"
+                msg = f"{msg_head}\nAsset: {sym} ({tf})\nPrice: {entry_plan}\nTP: {tp_plan}\nSL: {sl_plan}\nRSI: {rsi_val:.0f}\nTime: {last_sig['Waktu'].strftime('%H:%M')}"
                 send_telegram(msg)
-                st.toast("Sinyal Terkirim!", icon="🚀")
+                st.toast("Sinyal Terkirim ke Telegram!", icon="🚀")
 
-    # Helper
+    # Format Helper
     def fmt(x): return f"{x:,.0f}".replace(",", ".")
 
-    # --- LAYOUT (DITAMBAH TAMPILAN RSI) ---
+    # --- UI LAYOUT (CSS) ---
     st.markdown(f"""
     <style>
         .row-1 {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
@@ -288,51 +311,61 @@ def dashboard(sym, tf):
     </div>
     """, unsafe_allow_html=True)
     
-    # --- CHART ---
+    # --- CHART PLOTTING ---
     range_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
-    range_start = df['timestamp'].iloc[-60]
+    range_start = df['timestamp'].iloc[-80]
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
-    fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_200'], line=dict(color='yellow', width=2), name='EMA 200'), row=1, col=1)
     
+    # Candle & EMA
+    fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_200'], line=dict(color='yellow', width=1.5), name='EMA 200'), row=1, col=1)
+    
+    # Zones Overlay
     for z in zones:
         end_t = df['timestamp'].iloc[-1] + timedelta(hours=4)
-        fig.add_shape(type="rect", x0=z['time'], y0=z['bot'], x1=end_t, y1=z['top'], fillcolor=z['color'], line_color=z['line'], line_width=1, row=1, col=1)
+        fig.add_shape(type="rect", x0=z['time'], y0=z['bot'], x1=end_t, y1=z['top'], 
+                      fillcolor=z['color'], line_color=z['line'], line_width=1, row=1, col=1)
     
+    # Buy/Sell Markers
     if df['sig_buy'].any():
-        fig.add_trace(go.Scatter(x=df[df['sig_buy']]['timestamp'], y=df[df['sig_buy']]['low'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='Buy'), row=1, col=1)
+        buy_sig = df[df['sig_buy']]
+        fig.add_trace(go.Scatter(x=buy_sig['timestamp'], y=buy_sig['low'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='Buy Signal'), row=1, col=1)
     if df['sig_sell'].any():
-        fig.add_trace(go.Scatter(x=df[df['sig_sell']]['timestamp'], y=df[df['sig_sell']]['high'], mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ff1744'), name='Sell'), row=1, col=1)
+        sell_sig = df[df['sig_sell']]
+        fig.add_trace(go.Scatter(x=sell_sig['timestamp'], y=sell_sig['high'], mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ff1744'), name='Sell Signal'), row=1, col=1)
 
+    # MACD Panel
     fig.add_trace(go.Bar(x=df['timestamp'], y=df['Hist'], name='Histogram', marker_color=np.where(df['Hist']<0, '#ff1744', '#00e676')), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], line=dict(color='#2962ff'), name='MACD'), row=2, col=1)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Signal'], line=dict(color='#ff9100'), name='Signal'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], line=dict(color='#2962ff', width=1.5), name='MACD'), row=2, col=1)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Signal'], line=dict(color='#ff9100', width=1.5), name='Signal'), row=2, col=1)
     
-    fig.update_layout(height=550, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), xaxis_range=[range_start, range_end], xaxis2_range=[range_start, range_end], xaxis_rangeslider_visible=False)
+    fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), 
+                      xaxis_range=[range_start, range_end], xaxis2_range=[range_start, range_end], xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
     
+    # Table Info
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("📋 Zona Supply & Demand (Limit Order)")
+        st.subheader("📋 Active Zones")
         if zones:
             z_data = [[f"{'🟦 DEMAND' if z['type']=='DEMAND' else '🟧 SUPPLY'}", f"Rp {fmt(z['bot'])} - {fmt(z['top'])}", z['time'].strftime('%H:%M %d/%m')] for z in reversed(zones[-5:])]
-            st.table(pd.DataFrame(z_data, columns=["Tipe", "Rentang Harga", "Waktu"]))
-    with col2:
-        st.subheader("📊 Histori Sinyal (100 Candle Terakhir)")
-        if history:
-            h_df = pd.DataFrame(history).iloc[::-1]
-            h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M (%d/%m)') 
-            h_df['Harga Entry'] = h_df['Entry'].apply(lambda x: f"Rp {fmt(x)}")
-            h_df['Stop Loss'] = h_df['SL'].apply(lambda x: f"Rp {fmt(x)}")
-            h_df['Take Profit'] = h_df['TP'].apply(lambda x: f"Rp {fmt(x)}")
+            st.table(pd.DataFrame(z_data, columns=["Tipe", "Rentang", "Waktu"]))
+        else:
+            st.caption("Tidak ada zona valid dekat harga sekarang.")
             
+    with col2:
+        st.subheader("📊 Signal History")
+        if history:
+            h_df = pd.DataFrame(history).iloc[::-1] # Reverse order
+            h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M (%d/%m)') 
             st.dataframe(
-                h_df[['Waktu', 'Tipe', 'Harga Entry', 'Stop Loss', 'Take Profit', 'Status']], 
+                h_df[['Waktu', 'Tipe', 'Entry', 'TP', 'Status']], 
                 use_container_width=True,
                 hide_index=True
             )
         else:
-            st.caption("Belum ada sinyal valid.")
+            st.caption("Belum ada sinyal terbentuk.")
 
+# Jalankan Dashboard
 dashboard(symbol, timeframe)
