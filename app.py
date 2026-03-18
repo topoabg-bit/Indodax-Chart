@@ -279,28 +279,6 @@ def dashboard(sym, tf):
                 send_telegram(msg)
                 st.toast("Sinyal Terkirim ke Telegram!", icon="🚀")
                 
-    def cek_tembok(symbol):
-    exchange = ccxt.indodax()
-    # Ambil 10 antrian teratas
-    ob = exchange.fetch_order_book(symbol, limit=10)
-    
-    # Hitung total volume 5 bid teratas vs 5 ask teratas
-    bids_vol = sum([bid[1] for bid in ob['bids'][:5]]) # [harga, volume]
-    asks_vol = sum([ask[1] for ask in ob['asks'][:5]])
-    
-    ratio = bids_vol / asks_vol if asks_vol > 0 else 0
-    
-    if ratio > 3:
-        return "TEMBOK BELI KUAT 🛡️"
-    elif ratio < 0.33:
-        return "TEMBOK JUAL KERAS 🧱"
-    else:
-        return "NETRAL ⚖️"
-
-    # Panggil fungsi ini di dalam dashboard dan tampilkan hasilnya
-    status_tembok = cek_tembok(symbol)
-    st.metric("Analisa Orderbook", status_tembok)
-
     # Format Helper
     def fmt(x): return f"{x:,.0f}".replace(",", ".")
 
