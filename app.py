@@ -54,7 +54,7 @@ def get_orderbook_analysis(symbol):
     try:
         exchange = ccxt.indodax()
         # Ambil 20 antrian teratas untuk mencari tembok tebal
-        ob = exchange.fetch_order_book(symbol, limit=50)
+        ob = exchange.fetch_order_book(symbol, limit=30)
         
         # 1. Cari Tembok Beli (Bid) Terbesar
         # Kita cari entry dengan Volume x Harga (Value) terbesar, atau Volume murni terbesar
