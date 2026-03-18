@@ -360,7 +360,7 @@ def dashboard(sym, tf):
             h_df = pd.DataFrame(history).iloc[::-1] # Reverse order
             h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M (%d/%m)') 
             st.dataframe(
-                h_df[['Waktu', 'Tipe', 'Entry', 'TP', 'Status']], 
+                h_df[['Waktu', 'Tipe', 'Entry', 'TP', 'SL', 'Status']], 
                 use_container_width=True,
                 hide_index=True
             )
