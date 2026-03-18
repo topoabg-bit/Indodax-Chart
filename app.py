@@ -16,8 +16,8 @@ st.set_page_config(layout="wide", page_title="Indodax Scalper V8.1: Fee Guard")
 # --- TELEGRAM SETTINGS (ISI DISINI) ---
 def send_telegram(message):
     # GANTI DENGAN TOKEN & CHAT ID ANDA
-    BOT_TOKEN = "TOKEN_BOT_ANDA_DISINI" 
-    CHAT_ID = "CHAT_ID_ANDA_DISINI"
+    BOT_TOKEN = "7992906337:AAGPstFckZsaMmabZDA6m_EauP-aTqQxlZQ" 
+    CHAT_ID = "8107526630"
     
     # Skip jika token belum diisi
     if "TOKEN_BOT" in BOT_TOKEN:
@@ -221,7 +221,7 @@ def generate_signals(df, zones):
 # ==========================================
 st.sidebar.header("🎛️ Indodax Scalper V8.1")
 symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR', 'USDT/IDR'])
-timeframe = st.sidebar.selectbox("Timeframe", ['1m', '15m', '30m', '1h', '4h', '1d'])
+timeframe = st.sidebar.selectbox("Timeframe", ['1m', '5m', '15m', '30m', '1h', '4h', '1d'])
 st.title(f"Scalper Pro: {symbol} ({timeframe})")
 
 # Auto-refresh setiap 60 detik
