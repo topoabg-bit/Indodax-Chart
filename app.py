@@ -388,29 +388,76 @@ def dashboard(sym, tf):
     
     fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), xaxis_range=[range_start, range_end], xaxis2_range=[range_start, range_end], xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
-    
-    # --- BAGIAN BAWAH: TABEL ORDERBOOK & LOG ---
-    c1, c2, c3 = st.columns([1, 1, 1.5])
-    
-    if ob_data:
-        with c1:
-            st.markdown("### 🛡️ Orderbook (Bids)")
-            st.dataframe(ob_data['bids_df'].style.format({"price": "{:,.0f}", "volume": "{:,.2f}"}), use_container_width=True, hide_index=True)
-            st.caption(f"Tembok Terkuat: **Rp {fmt(ob_data['buy_wall_price'])}** ({fmt(ob_data['buy_wall_vol'])})")
-            
-        with c2:
-            st.markdown("### 🧱 Orderbook (Asks)")
-            st.dataframe(ob_data['asks_df'].style.format({"price": "{:,.0f}", "volume": "{:,.2f}"}), use_container_width=True, hide_index=True)
-            st.caption(f"Tembok Terkuat: **Rp {fmt(ob_data['sell_wall_price'])}** ({fmt(ob_data['sell_wall_vol'])})")
 
-    with c3:
-        st.markdown("### 📊 Riwayat Sinyal")
+    # ==========================================
+    # --- BAGIAN BAWAH 1: ZONA & SINYAL ---
+    # ==========================================
+    st.markdown("### 📋 Analisa Teknikal (Zones & Signals)")
+    c_mid1, c_mid2 = st.columns(2)
+    
+    with c_mid1:
+        st.caption("🟦 Demand (Support) & 🟧 Supply (Resistance)")
+        if zones:
+            # Format data zona untuk tabel
+            z_data = []
+            for z in reversed(zones[-5:]): # Ambil 5 zona terakhir
+                tipe = "🟦 DEMAND" if z['type'] == 'DEMAND' else "🟧 SUPPLY"
+                area = f"{fmt(z['bot'])} - {fmt(z['top'])}"
+                waktu = z['time'].strftime('%H:%M %d/%m')
+                z_data.append([tipe, area, waktu])
+            
+            df_zones = pd.DataFrame(z_data, columns=["Tipe", "Area Harga (Rp)", "Waktu Terbentuk"])
+            st.table(df_zones)
+        else:
+            st.info("Tidak ada zona Supply/Demand valid di dekat harga saat ini.")
+
+    with c_mid2:
+        st.caption("📊 100 Sinyal Terakhir")
         if history:
             h_df = pd.DataFrame(history).iloc[::-1]
-            h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M')
-            st.dataframe(h_df[['Waktu', 'Tipe', 'Entry', 'Status']], use_container_width=True, hide_index=True)
+            h_df['Waktu'] = h_df['Waktu'].dt.strftime('%H:%M %d/%m')
+            # Format angka di tabel agar cantik
+            h_df['Entry'] = h_df['Entry'].apply(lambda x: fmt(x))
+            
+            st.dataframe(
+                h_df[['Waktu', 'Tipe', 'Entry', 'Status']], 
+                use_container_width=True, 
+                hide_index=True,
+                height=200 # Batasi tinggi agar scrollable jika panjang
+            )
         else:
-            st.info("Belum ada sinyal terbentuk.")
+            st.info("Belum ada sinyal terbentuk. Menunggu konfirmasi market...")
+
+    # ==========================================
+    # --- BAGIAN BAWAH 2: ORDERBOOK WALL DETECTOR ---
+    # ==========================================
+    st.divider() # Garis pembatas
+    st.markdown("### 🧱 Market Depth (Deteksi Tembok Orderbook)")
+    
+    if ob_data:
+        c_bot1, c_bot2 = st.columns(2)
+        
+        with c_bot1:
+            # Header dengan indikator Wall Price
+            st.success(f"🛡️ **Bids (Antrian Beli)** — Wall Terkuat: **Rp {fmt(ob_data['buy_wall_price'])}**")
+            
+            # Highlight baris yang merupakan tembok (opsional, via Pandas Styler)
+            st.dataframe(
+                ob_data['bids_df'].style.format({"price": "Rp {:,.0f}", "volume": "{:,.2f}"}), 
+                use_container_width=True, 
+                hide_index=True
+            )
+            
+        with c_bot2:
+            st.error(f"🧱 **Asks (Antrian Jual)** — Wall Terkuat: **Rp {fmt(ob_data['sell_wall_price'])}**")
+            
+            st.dataframe(
+                ob_data['asks_df'].style.format({"price": "Rp {:,.0f}", "volume": "{:,.2f}"}), 
+                use_container_width=True, 
+                hide_index=True
+            )
+    else:
+        st.warning("Gagal memuat data Orderbook. Cek koneksi API Indodax.")
 
 # Jalankan Dashboard
 dashboard(symbol, timeframe)
