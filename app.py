@@ -10,7 +10,7 @@ import requests
 # ==========================================
 # --- 1. KONFIGURASI & SETUP ---
 # ==========================================
-st.set_page_config(layout="wide", page_title="Indodax Scalper V8.3 (Supertrend)")
+st.set_page_config(layout="wide", page_title="Indodax Scalper V8.4 Final")
 
 # --- TELEGRAM SETTINGS ---
 def send_telegram(message):
@@ -49,12 +49,11 @@ def get_data(symbol, tf):
 def get_orderbook_analysis(symbol):
     try:
         exchange = ccxt.indodax()
-        # UPDATE: Ambil 50 antrian teratas (Deep Scan)
+        # Ambil 50 antrian teratas (Deep Scan)
         ob = exchange.fetch_order_book(symbol, limit=50)
         
         # Analisa Bids (Beli)
         bids = pd.DataFrame(ob['bids'], columns=['price', 'volume'])
-        # Cari harga dengan Volume tertinggi sebagai 'Wall'
         max_bid_idx = bids['volume'].idxmax()
         wall_buy_price = bids.iloc[max_bid_idx]['price']
         wall_buy_vol = bids.iloc[max_bid_idx]['volume']
@@ -70,7 +69,7 @@ def get_orderbook_analysis(symbol):
             'buy_wall_vol': wall_buy_vol,
             'sell_wall_price': wall_sell_price,
             'sell_wall_vol': wall_sell_vol,
-            'bids_df': bids.head(10), # Tampilkan 10 teratas di tabel
+            'bids_df': bids.head(10), 
             'asks_df': asks.head(10)
         }
     except Exception as e:
@@ -98,7 +97,7 @@ def process_indicators(df):
     
     # Volume Analysis
     df['Vol_MA'] = df['volume'].rolling(20).mean()
-    df['Vol_Spike'] = df['volume'] > (df['Vol_MA'] * 1.5) # Harus 1.5x rata-rata
+    df['Vol_Spike'] = df['volume'] > (df['Vol_MA'] * 1.5) 
     
     # Candle Patterns
     df['Bull_Engulf'] = (df['close'] > df['open']) & (df['close'] > df['open'].shift(1)) & \
@@ -114,7 +113,7 @@ def process_indicators(df):
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
     
-    # --- BARU: SUPERTREND CALCULATION ---
+    # --- SUPERTREND LOGIC ---
     st_period = 10
     st_mul = 3
     
@@ -122,10 +121,8 @@ def process_indicators(df):
     df['st_upper'] = hl2 + (st_mul * df['ATR'])
     df['st_lower'] = hl2 - (st_mul * df['ATR'])
     df['supertrend'] = np.nan
-    df['st_dir'] = 1 # 1=Bull, -1=Bear
+    df['st_dir'] = 1 
     
-    # Iterasi Manual untuk Supertrend (Wajib urut waktu)
-    # Kita mulai dari index 1 karena butuh data sebelumnya
     for i in range(1, len(df)):
         curr_close = df['close'].iloc[i]
         prev_close = df['close'].iloc[i-1]
@@ -138,19 +135,16 @@ def process_indicators(df):
         
         prev_dir = df['st_dir'].iloc[i-1]
         
-        # Logic Upper (Hanya boleh turun)
         if curr_upper < prev_upper or prev_close > prev_upper:
             df.at[df.index[i], 'st_upper'] = curr_upper
         else:
             df.at[df.index[i], 'st_upper'] = prev_upper
             
-        # Logic Lower (Hanya boleh naik)
         if curr_lower > prev_lower or prev_close < prev_lower:
             df.at[df.index[i], 'st_lower'] = curr_lower
         else:
             df.at[df.index[i], 'st_lower'] = prev_lower
             
-        # Logic Direction Check
         if prev_dir == 1:
             if curr_close < df.at[df.index[i], 'st_lower']:
                 df.at[df.index[i], 'st_dir'] = -1
@@ -196,7 +190,6 @@ def detect_zones(df):
         if future.empty:
             active.append(z)
         elif z['type'] == 'DEMAND':
-            # Validasi Ekor (Wick)
             if not (future['low'] < z['bot']).any(): 
                 active.append(z)
         else:
@@ -219,11 +212,8 @@ def generate_signals(df, zones):
         
         safe_buy = row['RSI'] < 70  
         safe_sell = row['RSI'] > 30
-        
-        # FEE GUARD: Min Profit Bersih harus > 0.2% (Total Spread > 0.8%)
         min_spread = 0.008  
         
-        # Pola Candle & MACD
         is_hammer = (row['close'] > row['open']) and ((row['open'] - row['low']) > 2 * (row['close'] - row['open']))
         trigger_buy = row['Bull_Engulf'] or row['Vol_Spike'] or is_hammer
         
@@ -233,7 +223,6 @@ def generate_signals(df, zones):
         zone_signal_taken = False
         entry = row['close']
 
-        # --- STRATEGI 1: ZONA ---
         if row['MACD'] > row['Signal'] and trigger_buy and safe_buy:
             for z in zones:
                 if z['type'] == 'DEMAND' and z['time'] < row['timestamp']:
@@ -247,7 +236,6 @@ def generate_signals(df, zones):
                             zone_signal_taken = True
                         break
 
-        # --- STRATEGI 2: MOMENTUM ---
         if not zone_signal_taken and macd_cross_buy and safe_buy:
             sl = row['low'] - (row['ATR'] * 1.5)
             tp = entry + ((entry - sl) * 1.5)
@@ -256,8 +244,6 @@ def generate_signals(df, zones):
                 df.loc[df.index[i], 'sig_buy'] = True
                 history.append({'Waktu': row['timestamp'], 'Tipe': 'BUY (Momtm)', 'Entry': entry, 'SL': sl, 'TP': tp, 'Status': 'Active'})
 
-        # Logic SELL (Mirroring Buy logic here for brevity if needed, but focused on Buy for Spot)
-        # (Kode Sell sama seperti sebelumnya, disederhanakan untuk fokus Spot Market Indodax)
         if macd_cross_sell and safe_sell:
              sl = row['high'] + (row['ATR'] * 1.5)
              tp = entry - ((sl - entry) * 1.5)
@@ -270,7 +256,7 @@ def generate_signals(df, zones):
 # ==========================================
 # --- 6. DASHBOARD UTAMA ---
 # ==========================================
-st.sidebar.header("🎛️ Scalper V8.3")
+st.sidebar.header("🎛️ Scalper V8.4")
 symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR', 'USDT/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['1m', '15m', '30m', '1h', '4h'])
 st.title(f"Scalper Pro: {symbol} ({timeframe})")
@@ -284,20 +270,16 @@ def dashboard(sym, tf):
     zones = detect_zones(df)
     df, history = generate_signals(df, zones)
     
-    # --- LOAD ORDERBOOK ANALYSIS ---
     ob_data = get_orderbook_analysis(sym)
     
-    # Realtime Vars
     curr = float(ticker['last'])
     vol = float(ticker['baseVolume'])
     rsi_val = df['RSI'].iloc[-1]
     
-    # Tentukan Trend berdasarkan Supertrend Terakhir
     st_dir = df['st_dir'].iloc[-1]
     trend_txt = "BULLISH 🟢" if st_dir == 1 else "BEARISH 🔴"
     trend_col = "#00e676" if st_dir == 1 else "#ff1744"
 
-    # --- NOTIFIKASI ---
     if 'last_alert_time' not in st.session_state:
         st.session_state['last_alert_time'] = None
     
@@ -310,7 +292,7 @@ def dashboard(sym, tf):
         if last_sig['Waktu'] == df['timestamp'].iloc[-1]:
             if st.session_state['last_alert_time'] != last_sig['Waktu']:
                 st.session_state['last_alert_time'] = last_sig['Waktu']
-                msg = f"⚠️ SIGNALE BARU: {sym}\nType: {last_sig['Tipe']}\nPrice: {last_sig['Entry']}"
+                msg = f"⚠️ SIGNAL: {sym}\nType: {last_sig['Tipe']}\nPrice: {last_sig['Entry']}"
                 send_telegram(msg)
                 st.toast("Signal Sent!", icon="🚀")
                 
@@ -324,7 +306,6 @@ def dashboard(sym, tf):
 
     def fmt(x): return f"{x:,.0f}".replace(",", ".")
 
-    # --- HTML LAYOUT ---
     st.markdown(f"""
     <style>
         .row-1 {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
@@ -347,32 +328,28 @@ def dashboard(sym, tf):
         <div class="box"><div class="lbl">ENTRY PLAN</div><div class="val" style="color:#29b6f6">{entry_plan}</div></div>
         <div class="box"><div class="lbl">RSI (14)</div><div class="val">{rsi_val:.0f}</div></div>
         <div class="box"><div class="lbl">TREND (ST)</div><div class="val" style="color:{trend_col}">{trend_txt}</div></div>
-        <!-- WALL INDICATORS -->
         <div class="box"><div class="lbl">BUY WALL</div><div class="val" style="color:#00e676">{fmt(ob_data['buy_wall_price']) if ob_data else '-'}</div></div>
         <div class="box"><div class="lbl">SELL WALL</div><div class="val" style="color:#ff1744">{fmt(ob_data['sell_wall_price']) if ob_data else '-'}</div></div>
     </div>
     """, unsafe_allow_html=True)
 
-    # --- PLOT CHART ---
-    range_start = df['timestamp'].iloc[-100] # Zoom 100 candle terakhir
+    # --- PLOT CHART (FIXED ZOOM) ---
+    # Definisi Range: 60 Candle terakhir + Buffer Kanan 15 menit
+    range_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
+    range_start = df['timestamp'].iloc[-60] # KEMBALI KE 60 CANDLE
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
     
-    # 1. Candlestick
     fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
     
-    # 2. SUPERTREND LINES (Fix: Filtering Data)
-    # Pisahkan data Bull (Hijau) dan Bear (Merah) agar garis tidak nyambung sembarangan
     st_bull = df.copy()
     st_bull.loc[st_bull['st_dir'] == -1, 'supertrend'] = np.nan
-    
     st_bear = df.copy()
     st_bear.loc[st_bear['st_dir'] == 1, 'supertrend'] = np.nan
     
     fig.add_trace(go.Scatter(x=st_bull['timestamp'], y=st_bull['supertrend'], line=dict(color='#00e676', width=2), name='ST Bull'), row=1, col=1)
     fig.add_trace(go.Scatter(x=st_bear['timestamp'], y=st_bear['supertrend'], line=dict(color='#ff1744', width=2), name='ST Bear'), row=1, col=1)
     
-    # 3. Zones & Walls
     for z in zones:
         end_t = df['timestamp'].iloc[-1] + timedelta(hours=4)
         fig.add_shape(type="rect", x0=z['time'], y0=z['bot'], x1=end_t, y1=z['top'], 
@@ -382,24 +359,23 @@ def dashboard(sym, tf):
         fig.add_hline(y=ob_data['buy_wall_price'], line_dash="dash", line_color="#00e676", annotation_text="BUY WALL", row=1, col=1)
         fig.add_hline(y=ob_data['sell_wall_price'], line_dash="dash", line_color="#ff1744", annotation_text="SELL WALL", row=1, col=1)
     
-    # 4. Signal Markers
     if df['sig_buy'].any():
         fig.add_trace(go.Scatter(x=df[df['sig_buy']]['timestamp'], y=df[df['sig_buy']]['low'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='Buy'), row=1, col=1)
     
-    # 5. MACD
     fig.add_trace(go.Bar(x=df['timestamp'], y=df['Hist'], marker_color=np.where(df['Hist']<0, '#ff1744', '#00e676')), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], line=dict(color='#2962ff'), name='MACD'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Signal'], line=dict(color='#ff9100'), name='Signal'), row=2, col=1)
     
-    fig.update_layout(height=650, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), xaxis_range=[range_start, df['timestamp'].iloc[-1]+timedelta(minutes=30)], xaxis_rangeslider_visible=False)
+    # FIX: Gunakan range_start dan range_end yang sudah didefinisikan ulang
+    fig.update_layout(height=650, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), 
+                      xaxis_range=[range_start, range_end], xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
     
-    # --- BAGIAN TENGAH: TABEL ZONA & HISTORI ---
     st.markdown("### 📋 Analisa Teknikal")
     c1, c2 = st.columns(2)
     
     with c1:
-        st.caption("Zona Supply & Demand (Support/Resist)")
+        st.caption("Zona Supply & Demand")
         if zones:
             z_list = []
             for z in reversed(zones[-5:]):
@@ -413,7 +389,7 @@ def dashboard(sym, tf):
             st.info("Tidak ada zona valid dekat harga sekarang.")
             
     with c2:
-        st.caption("Riwayat Sinyal (Terakhir)")
+        st.caption("Riwayat Sinyal")
         if history:
             h_df = pd.DataFrame(history).iloc[::-1]
             h_df['Entry'] = h_df['Entry'].apply(lambda x: fmt(x))
@@ -422,7 +398,6 @@ def dashboard(sym, tf):
         else:
             st.info("Menunggu sinyal...")
 
-    # --- BAGIAN BAWAH: ORDERBOOK DEPTH ---
     st.divider()
     st.markdown("### 🧱 Market Depth (50 Top Queues)")
     if ob_data:
@@ -434,5 +409,4 @@ def dashboard(sym, tf):
             st.error(f"🧱 **Asks (Antrian Jual)** | Wall: **{fmt(ob_data['sell_wall_price'])}**")
             st.dataframe(ob_data['asks_df'].style.format({"price": "{:,.0f}", "volume": "{:,.2f}"}), use_container_width=True, hide_index=True)
 
-# Execute
 dashboard(symbol, timeframe)
