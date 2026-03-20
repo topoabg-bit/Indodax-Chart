@@ -118,7 +118,57 @@ def process_indicators(df):
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
+
+    # ... (Kode lama: EMA, MACD, ATR biarkan tetap ada) ...
+    # Pastikan ATR sudah dihitung di baris sebelumnya!
     
+    # --- UPDATE: SUPERTREND CALCULATION ---
+    # Parameter standar: Period 10, Multiplier 3 (Bisa diubah jadi 2 untuk scalp cepat)
+    st_period = 10
+    st_mul = 3
+    
+    # Hitung Basic Bands
+    hl2 = (df['high'] + df['low']) / 2
+    df['st_upper'] = hl2 + (st_mul * df['ATR'])
+    df['st_lower'] = hl2 - (st_mul * df['ATR'])
+    df['supertrend'] = np.nan
+    df['st_dir'] = 1 # 1 = Bull (Hijau), -1 = Bear (Merah)
+
+    # Loop Iteratif (Supertrend butuh nilai candle sebelumnya)
+    # Kita pakai Numba atau Loop biasa (karena data cuma 500 baris, loop biasa masih aman)
+    for i in range(1, len(df)):
+        curr = df.iloc[i]
+        prev = df.iloc[i-1]
+        
+        # Logic Upper Band (Turun saja, tidak boleh naik saat Downtrend)
+        if curr['st_upper'] < prev['st_upper'] or prev['close'] > prev['st_upper']:
+            df.at[df.index[i], 'st_upper'] = curr['st_upper']
+        else:
+            df.at[df.index[i], 'st_upper'] = prev['st_upper']
+            
+        # Logic Lower Band (Naik saja, tidak boleh turun saat Uptrend)
+        if curr['st_lower'] > prev['st_lower'] or prev['close'] < prev['st_lower']:
+            df.at[df.index[i], 'st_lower'] = curr['st_lower']
+        else:
+            df.at[df.index[i], 'st_lower'] = prev['st_lower']
+            
+        # Logic Arah Trend
+        prev_dir = prev.get('st_dir', 1)
+        if prev_dir == 1:
+            if curr['close'] < curr['st_lower']:
+                df.at[df.index[i], 'st_dir'] = -1
+                df.at[df.index[i], 'supertrend'] = df.at[df.index[i], 'st_upper']
+            else:
+                df.at[df.index[i], 'st_dir'] = 1
+                df.at[df.index[i], 'supertrend'] = df.at[df.index[i], 'st_lower']
+        elif prev_dir == -1:
+            if curr['close'] > curr['st_upper']:
+                df.at[df.index[i], 'st_dir'] = 1
+                df.at[df.index[i], 'supertrend'] = df.at[df.index[i], 'st_lower']
+            else:
+                df.at[df.index[i], 'st_dir'] = -1
+                df.at[df.index[i], 'supertrend'] = df.at[df.index[i], 'st_upper']
+
     return df
 
 # ==========================================
@@ -388,6 +438,29 @@ def dashboard(sym, tf):
     
     fig.update_layout(height=600, template="plotly_dark", margin=dict(l=0,r=50,t=0,b=0), xaxis_range=[range_start, range_end], xaxis2_range=[range_start, range_end], xaxis_rangeslider_visible=False)
     st.plotly_chart(fig, use_container_width=True)
+
+    # --- UPDATE: PLOT SUPERTREND ---
+    # Kita bagi jadi dua trace (Hijau & Merah) agar warnanya dinamis
+    
+    # Ambil data Supertrend Bullish (Hijau)
+    st_bull = df.copy()
+    st_bull.loc[st_bull['st_dir'] == -1, 'supertrend'] = None # Hapus data bear
+    
+    # Ambil data Supertrend Bearish (Merah)
+    st_bear = df.copy()
+    st_bear.loc[st_bear['st_dir'] == 1, 'supertrend'] = None # Hapus data bull
+
+    fig.add_trace(go.Scatter(
+        x=st_bull['timestamp'], y=st_bull['supertrend'],
+        line=dict(color='#00e676', width=2), # Hijau Tebal
+        name='Supertrend (Bull)'
+    ), row=1, col=1)
+    
+    fig.add_trace(go.Scatter(
+        x=st_bear['timestamp'], y=st_bear['supertrend'],
+        line=dict(color='#ff1744', width=2), # Merah Tebal
+        name='Supertrend (Bear)'
+    ), row=1, col=1)
 
     # ==========================================
     # --- BAGIAN BAWAH 1: ZONA & SINYAL ---
