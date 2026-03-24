@@ -53,8 +53,6 @@ def get_orderbook_analysis(symbol):
         ob = exchange.fetch_order_book(symbol, limit=20)
         
         # 1. Cari Tembok Beli (Bid) Terbesar
-        # Kita cari entry dengan Volume x Harga (Value) terbesar, atau Volume murni terbesar
-        # Di sini kita cari Volume terbesar sebagai "Tembok"
         bids = pd.DataFrame(ob['bids'], columns=['price', 'volume'])
         max_bid_idx = bids['volume'].idxmax()
         wall_buy_price = bids.iloc[max_bid_idx]['price']
