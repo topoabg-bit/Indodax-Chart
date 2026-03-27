@@ -110,6 +110,60 @@ def process_indicators(df):
     loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
     rs = gain / loss
     df['RSI'] = 100 - (100 / (1 + rs))
+
+    # --- [BARU] FUNGSI HITUNG GAINZ REPLICA ---
+def calculate_gainz_replica(df, period=10, multiplier=3.0):
+    # 1. Hitung ATR khusus untuk Gainz
+    df['tr0'] = abs(df['high'] - df['low'])
+    df['tr1'] = abs(df['high'] - df['close'].shift(1))
+    df['tr2'] = abs(df['low'] - df['close'].shift(1))
+    df['tr_gainz'] = df[['tr0', 'tr1', 'tr2']].max(axis=1)
+    df['atr_gainz'] = df['tr_gainz'].ewm(alpha=1/period, adjust=False).mean()
+
+    # 2. Hitung Basic Bands
+    df['hl2'] = (df['high'] + df['low']) / 2
+    df['basic_upper'] = df['hl2'] + (multiplier * df['atr_gainz'])
+    df['basic_lower'] = df['hl2'] - (multiplier * df['atr_gainz'])
+
+    # 3. Hitung Final Bands & Trend (Supertrend Logic)
+    df['final_upper'] = df['basic_upper']
+    df['final_lower'] = df['basic_lower']
+    df['trend_gainz'] = 1 # 1 = Green, -1 = Red
+    
+    # Loop iterasi (Wajib untuk logika Supertrend)
+    for i in range(1, len(df)):
+        # Logic Upper
+        if df['basic_upper'].iloc[i] < df['final_upper'].iloc[i-1] or df['close'].iloc[i-1] > df['final_upper'].iloc[i-1]:
+            df.at[df.index[i], 'final_upper'] = df['basic_upper'].iloc[i]
+        else:
+            df.at[df.index[i], 'final_upper'] = df['final_upper'].iloc[i-1]
+
+        # Logic Lower
+        if df['basic_lower'].iloc[i] > df['final_lower'].iloc[i-1] or df['close'].iloc[i-1] < df['final_lower'].iloc[i-1]:
+            df.at[df.index[i], 'final_lower'] = df['basic_lower'].iloc[i]
+        else:
+            df.at[df.index[i], 'final_lower'] = df['final_lower'].iloc[i-1]
+            
+        # Logic Trend Direction
+        if df['trend_gainz'].iloc[i-1] == 1:
+            if df['close'].iloc[i] < df['final_lower'].iloc[i-1]:
+                df.at[df.index[i], 'trend_gainz'] = -1
+            else:
+                df.at[df.index[i], 'trend_gainz'] = 1
+        else:
+            if df['close'].iloc[i] > df['final_upper'].iloc[i-1]:
+                df.at[df.index[i], 'trend_gainz'] = 1
+            else:
+                df.at[df.index[i], 'trend_gainz'] = -1
+
+    # 4. Split Garis untuk Plotting (Hijau vs Merah)
+    df['line_supertrend'] = np.where(df['trend_gainz'] == 1, df['final_lower'], df['final_upper'])
+    df['line_up'] = df.apply(lambda x: x['line_supertrend'] if x['trend_gainz'] == 1 else None, axis=1)
+    df['line_down'] = df.apply(lambda x: x['line_supertrend'] if x['trend_gainz'] == -1 else None, axis=1)
+
+    # 5. Sinyal Buy/Sell Gainz
+    df['gainz_buy'] = (df['trend_gainz'] == 1) & (df['trend_gainz'].shift(1) == -1)
+    df['gainz_sell'] = (df['trend_gainz'] == -1) & (df['trend_gainz'].shift(1) == 1)
     
     return df
 
@@ -251,6 +305,10 @@ def dashboard(sym, tf):
         return
         
     df = process_indicators(df)
+    
+    # --- [BARU] HITUNG GAINZ ALGO ---
+    df = calculate_gainz_replica(df, period=10, multiplier=3.0) 
+    
     zones = detect_zones(df)
     df, history = generate_signals(df, zones)
     
@@ -338,12 +396,41 @@ def dashboard(sym, tf):
     # --- CHART UTAMA DENGAN DYNAMIC ORDERBOOK LINES ---
     range_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
     range_start = df['timestamp'].iloc[-80]
+
+    # --- CHART UTAMA DENGAN GAINZ ALGO ---
+    range_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
+    range_start = df['timestamp'].iloc[-80]
     
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.75, 0.25])
     
     # 1. Candlestick
     fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_200'], line=dict(color='yellow', width=1), name='EMA 200'), row=1, col=1)
+    # --- [BARU] VISUALISASI GAINZ ALGO ---
+    # Garis Tren Hijau (Support)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['line_up'], mode='lines', line=dict(color='#00ff00', width=2), name='Gainz Bull'), row=1, col=1)
+    # Garis Tren Merah (Resistance)
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['line_down'], mode='lines', line=dict(color='#ff0000', width=2), name='Gainz Bear'), row=1, col=1)
+    
+    # Label BUY GAINZ
+    g_buy = df[df['gainz_buy']]
+    if not g_buy.empty:
+        fig.add_trace(go.Scatter(
+            x=g_buy['timestamp'], y=g_buy['low'] - (g_buy['atr_gainz']*0.5),
+            mode='markers+text', marker=dict(symbol='triangle-up', size=10, color='#00ff00'),
+            text='BUY', textposition="bottom center", textfont=dict(color='#00ff00', size=10),
+            name='G-Buy'
+        ), row=1, col=1)
+
+    # Label SELL GAINZ
+    g_sell = df[df['gainz_sell']]
+    if not g_sell.empty:
+        fig.add_trace(go.Scatter(
+            x=g_sell['timestamp'], y=g_sell['high'] + (g_sell['atr_gainz']*0.5),
+            mode='markers+text', marker=dict(symbol='triangle-down', size=10, color='#ff0000'),
+            text='SELL', textposition="top center", textfont=dict(color='#ff0000', size=10),
+            name='G-Sell'
+        ), row=1, col=1)
     
     # 2. Supply/Demand Zones (Rectangles)
     for z in zones:
