@@ -294,28 +294,39 @@ st.sidebar.header("🎛️ Indodax Scalper V8.1")
 symbol = st.sidebar.selectbox("Pair", ['BTC/IDR', 'ETH/IDR', 'SOL/IDR', 'DOGE/IDR', 'XRP/IDR', 'SHIB/IDR', 'USDT/IDR'])
 timeframe = st.sidebar.selectbox("Timeframe", ['1m', '5m', '15m', '30m', '1h', '4h', '1d'])
 st.title(f"Scalper Pro: {symbol} ({timeframe})")
-
-# --- 7. DASHBOARD VISUAL (V8.2 UPGRADE) ---
+# --- 7. DASHBOARD VISUAL (FINAL INTEGRATION) ---
 @st.fragment(run_every=60)
 def dashboard(sym, tf):
     # 1. Load Data
     df, ticker = get_data(sym, tf)
+    
     if df.empty:
-        st.warning("Menunggu data...")
+        st.warning("⏳ Menunggu data dari Indodax...")
         return
         
+    # --- [FIX PENTING] SAMAKAN NAMA KOLOM ---
+    # Mengubah 'High', 'Open' menjadi 'high', 'open' agar script tidak error
+    df.columns = [c.lower() for c in df.columns] 
+    # ----------------------------------------
+
+    # 2. Proses Indikator Standar
     df = process_indicators(df)
     
-    # --- [BARU] HITUNG GAINZ ALGO ---
-    df = calculate_gainz_replica(df, period=10, multiplier=3.0) 
+    # --- [INTEGRASI] HITUNG GAINZ ALGO ---
+    # Pastikan fungsi calculate_gainz_replica sudah ada di bagian atas script
+    try:
+        df = calculate_gainz_replica(df, period=10, multiplier=3.0)
+    except Exception as e:
+        st.error(f"Gagal menghitung GainzAlgo: {e}")
+    # -------------------------------------
     
     zones = detect_zones(df)
     df, history = generate_signals(df, zones)
     
-    # 2. Analisa Orderbook (WALL DETECTOR)
+    # 3. Analisa Orderbook (WALL DETECTOR)
     ob_data = get_orderbook_analysis(sym)
     
-    # 3. Variabel Realtime
+    # 4. Variabel Realtime
     curr = float(ticker['last'])
     vol = float(ticker['baseVolume'])
     high24 = float(ticker['high'])
@@ -338,6 +349,7 @@ def dashboard(sym, tf):
     
     if history:
         last_sig = history[-1]
+        # Cek jika sinyal terjadi pada candle terakhir
         if last_sig['Waktu'] == df['timestamp'].iloc[-1]:
             is_new = False
             if st.session_state['last_alert_time'] != last_sig['Waktu']:
@@ -358,13 +370,14 @@ def dashboard(sym, tf):
             sl_plan = f"Rp {last_sig['SL']:,.0f}"
             
             if is_new:
-                msg = f"{msg_head}\nAsset: {sym}\nPrice: {entry_plan}\nWall Support: {ob_data['buy_wall_price']}"
+                wall_msg = ob_data['buy_wall_price'] if ob_data else 0
+                msg = f"{msg_head}\nAsset: {sym}\nPrice: {entry_plan}\nWall Support: {wall_msg}"
                 send_telegram(msg)
                 st.toast("Sinyal Terkirim!", icon="🚀")
 
     def fmt(x): return f"{x:,.0f}".replace(",", ".")
 
-    # --- LAYOUT ATAS ---
+    # --- LAYOUT ATAS (CSS) ---
     st.markdown(f"""
     <style>
         .row-1 {{ display: grid; grid-template-columns: 1.5fr 1fr 1fr 1fr 1fr; gap: 8px; margin-bottom: 10px; }}
@@ -393,10 +406,6 @@ def dashboard(sym, tf):
     </div>
     """, unsafe_allow_html=True)
     
-    # --- CHART UTAMA DENGAN DYNAMIC ORDERBOOK LINES ---
-    range_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
-    range_start = df['timestamp'].iloc[-80]
-
     # --- CHART UTAMA DENGAN GAINZ ALGO ---
     range_end = df['timestamp'].iloc[-1] + timedelta(minutes=15)
     range_start = df['timestamp'].iloc[-80]
@@ -405,32 +414,48 @@ def dashboard(sym, tf):
     
     # 1. Candlestick
     fig.add_trace(go.Candlestick(x=df['timestamp'], open=df['open'], high=df['high'], low=df['low'], close=df['close'], name='Price'), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_200'], line=dict(color='yellow', width=1), name='EMA 200'), row=1, col=1)
-    # --- [BARU] VISUALISASI GAINZ ALGO ---
-    # Garis Tren Hijau (Support)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['line_up'], mode='lines', line=dict(color='#00ff00', width=2), name='Gainz Bull'), row=1, col=1)
-    # Garis Tren Merah (Resistance)
-    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['line_down'], mode='lines', line=dict(color='#ff0000', width=2), name='Gainz Bear'), row=1, col=1)
     
-    # Label BUY GAINZ
-    g_buy = df[df['gainz_buy']]
-    if not g_buy.empty:
+    # --- [VISUALISASI] GAINZ ALGO LINES ---
+    # Garis Tren Hijau (Support)
+    if 'line_up' in df.columns:
         fig.add_trace(go.Scatter(
-            x=g_buy['timestamp'], y=g_buy['low'] - (g_buy['atr_gainz']*0.5),
-            mode='markers+text', marker=dict(symbol='triangle-up', size=10, color='#00ff00'),
-            text='BUY', textposition="bottom center", textfont=dict(color='#00ff00', size=10),
-            name='G-Buy'
+            x=df['timestamp'], y=df['line_up'], 
+            mode='lines', line=dict(color='#00ff00', width=2), 
+            name='Gainz Bull'
         ), row=1, col=1)
 
-    # Label SELL GAINZ
-    g_sell = df[df['gainz_sell']]
-    if not g_sell.empty:
+    # Garis Tren Merah (Resistance)
+    if 'line_down' in df.columns:
         fig.add_trace(go.Scatter(
-            x=g_sell['timestamp'], y=g_sell['high'] + (g_sell['atr_gainz']*0.5),
-            mode='markers+text', marker=dict(symbol='triangle-down', size=10, color='#ff0000'),
-            text='SELL', textposition="top center", textfont=dict(color='#ff0000', size=10),
-            name='G-Sell'
+            x=df['timestamp'], y=df['line_down'], 
+            mode='lines', line=dict(color='#ff0000', width=2), 
+            name='Gainz Bear'
         ), row=1, col=1)
+        
+    # Label BUY GAINZ
+    if 'gainz_buy' in df.columns:
+        g_buy = df[df['gainz_buy']]
+        if not g_buy.empty:
+            fig.add_trace(go.Scatter(
+                x=g_buy['timestamp'], y=g_buy['low'] - (g_buy['atr_gainz'] * 0.5),
+                mode='markers+text', marker=dict(symbol='triangle-up', size=14, color='#00ff00'),
+                text='BUY', textposition="bottom center", textfont=dict(color='#00ff00', size=12, weight='bold'),
+                name='G-Buy'
+            ), row=1, col=1)
+
+    # Label SELL GAINZ
+    if 'gainz_sell' in df.columns:
+        g_sell = df[df['gainz_sell']]
+        if not g_sell.empty:
+            fig.add_trace(go.Scatter(
+                x=g_sell['timestamp'], y=g_sell['high'] + (g_sell['atr_gainz'] * 0.5),
+                mode='markers+text', marker=dict(symbol='triangle-down', size=14, color='#ff0000'),
+                text='SELL', textposition="top center", textfont=dict(color='#ff0000', size=12, weight='bold'),
+                name='G-Sell'
+            ), row=1, col=1)
+    # ---------------------------------------
+
+    fig.add_trace(go.Scatter(x=df['timestamp'], y=df['EMA_200'], line=dict(color='yellow', width=1, dash='dot'), name='EMA 200'), row=1, col=1)
     
     # 2. Supply/Demand Zones (Rectangles)
     for z in zones:
@@ -438,20 +463,20 @@ def dashboard(sym, tf):
         fig.add_shape(type="rect", x0=z['time'], y0=z['bot'], x1=end_t, y1=z['top'], 
                       fillcolor=z['color'], line_color=z['line'], line_width=1, row=1, col=1)
 
-    # 3. DYNAMIC ORDERBOOK LINES (FITUR BARU)
+    # 3. Orderbook Lines
     if ob_data:
         # Garis Support Dinamis (Buy Wall)
         fig.add_hline(y=ob_data['buy_wall_price'], line_dash="dash", line_color="#00e676", annotation_text=f"🛡️ BUY WALL: {fmt(ob_data['buy_wall_price'])}", annotation_position="bottom right", row=1, col=1)
         # Garis Resistance Dinamis (Sell Wall)
         fig.add_hline(y=ob_data['sell_wall_price'], line_dash="dash", line_color="#ff1744", annotation_text=f"🧱 SELL WALL: {fmt(ob_data['sell_wall_price'])}", annotation_position="top right", row=1, col=1)
 
-    # 4. Sinyal Markers
+    # 4. Sinyal Markers (Original Logic)
     if df['sig_buy'].any():
-        fig.add_trace(go.Scatter(x=df[df['sig_buy']]['timestamp'], y=df[df['sig_buy']]['low'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='#00e676'), name='Buy'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df[df['sig_buy']]['timestamp'], y=df[df['sig_buy']]['low'], mode='markers', marker=dict(symbol='circle', size=8, color='#00e676'), name='Old Buy'), row=1, col=1)
     if df['sig_sell'].any():
-        fig.add_trace(go.Scatter(x=df[df['sig_sell']]['timestamp'], y=df[df['sig_sell']]['high'], mode='markers', marker=dict(symbol='triangle-down', size=12, color='#ff1744'), name='Sell'), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df[df['sig_sell']]['timestamp'], y=df[df['sig_sell']]['high'], mode='markers', marker=dict(symbol='circle', size=8, color='#ff1744'), name='Old Sell'), row=1, col=1)
 
-    # 5. MACD
+    # 5. MACD (Panel Bawah)
     fig.add_trace(go.Bar(x=df['timestamp'], y=df['Hist'], marker_color=np.where(df['Hist']<0, '#ff1744', '#00e676'), name='Hist'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['MACD'], line=dict(color='#2962ff'), name='MACD'), row=2, col=1)
     fig.add_trace(go.Scatter(x=df['timestamp'], y=df['Signal'], line=dict(color='#ff9100'), name='Signal'), row=2, col=1)
@@ -484,3 +509,4 @@ def dashboard(sym, tf):
 
 # Jalankan Dashboard
 dashboard(symbol, timeframe)
+
