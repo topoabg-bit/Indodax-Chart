@@ -1,83 +1,111 @@
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-import requests
 import yfinance as yf
-from datetime import datetime
+from plotly.subplots import make_subplots
+import numpy as np
 
-# Konfigurasi Halaman
+# ==========================================
+# 1. KONFIGURASI HALAMAN & SIDEBAR
+# ==========================================
 st.set_page_config(page_title="Expert Quant Dashboard", layout="wide")
-st.title("📈 Multi-Market Trading Dashboard")
-st.markdown("Source: **Indodax** (Crypto) & **Yahoo Finance/IDX** (Stocks)")
+st.title("📈 Pro Trader Dashboard: Indodax & Stockbit (IDX)")
 
-# --- SIDEBAR: KONTROL ---
-st.sidebar.header("Pengaturan Market")
-market_type = st.sidebar.radio("Pilih Market:", ["Crypto (Indodax)", "Saham (IDX)"])
+st.sidebar.header("Konfigurasi Market")
+ticker = st.sidebar.text_input("Simbol (Contoh: BBCA.JK atau BTC-USD):", "BBCA.JK")
+timeframe = st.sidebar.selectbox("Timeframe:", ["1d", "1h", "15m", "5m"])
+period_input = st.sidebar.selectbox("Periode Data:", ["1mo", "3mo", "6mo", "1y"])
 
-if market_type == "Crypto (Indodax)":
-    # List pair populer Indodax
-    symbol = st.sidebar.selectbox("Pilih Asset:", ["btc_idr", "eth_idr", "doge_idr", "usdt_idr"])
-    interval = st.sidebar.selectbox("Timeframe:", ["1m", "5m", "15m", "1h", "1d"])
-else:
-    # Input kode saham (Gunakan akhiran .JK untuk Bursa Efek Indonesia)
-    ticker_input = st.sidebar.text_input("Kode Saham (Contoh: BBCA.JK):", "BBCA.JK")
-    period = st.sidebar.selectbox("Periode Data:", ["1d", "5d", "1mo", "6mo", "1y"])
-    interval = st.sidebar.selectbox("Interval:", ["1m", "5m", "15m", "1h", "1d"])
-
-# --- FUNGSI AMBIL DATA ---
-@st.cache_data(ttl=60)
-def get_indodax_data(pair):
-    # Mengambil ticker real-time
-    url = f"https://indodax.com/api/{pair}/ticker"
-    response = requests.get(url).json()
-    return response['ticker']
-
-@st.cache_data(ttl=60)
-def get_stock_data(ticker, p, i):
-    data = yf.download(tickers=ticker, period=p, interval=i)
-    return data
-
-# --- MAIN DISPLAY ---
-col1, col2 = st.columns([3, 1])
-
-with col1:
-    if market_type == "Crypto (Indodax)":
-        try:
-            ticker_data = get_indodax_data(symbol)
-            st.metric(f"Harga Terakhir {symbol.upper()}", 
-                      f"IDR {int(ticker_data['last']):,}", 
-                      f"{ticker_data.get('change', '0')}%")
+# ==========================================
+# 2. LOGIKA INDIKATOR (MFI & BBW)
+# ==========================================
+def add_indicators(df):
+    # Hitung Money Flow Index (MFI)
+    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+    money_flow = typical_price * df['Volume']
+    
+    pos_flow = []
+    neg_flow = []
+    for i in range(1, len(typical_price)):
+        if typical_price.iloc[i] > typical_price.iloc[i-1]:
+            pos_flow.append(money_flow.iloc[i])
+            neg_flow.append(0)
+        else:
+            pos_flow.append(0)
+            neg_flow.append(money_flow.iloc[i])
             
-            # Note: Indodax Public API standar tidak menyediakan OHLCV history yang mudah ditarik 
-            # tanpa library CCXT, jadi kita tampilkan data ringkasan.
-            st.info("Visualisasi Candlestick Crypto disarankan menggunakan CCXT untuk history lengkap.")
-        except Exception as e:
-            st.error(f"Gagal memuat data Indodax: {e}")
+    pos_res = pd.Series(pos_flow).rolling(window=14).sum()
+    neg_res = pd.Series(neg_flow).rolling(window=14).sum()
+    mfr = pos_res / neg_res
+    df['MFI'] = 100 - (100 / (1 + mfr)).values
+    
+    # Hitung Bollinger Band Width (BBW)
+    ma20 = df['Close'].rolling(window=20).mean()
+    std20 = df['Close'].rolling(window=20).std()
+    df['BBW'] = (((ma20 + (std20 * 2)) - (ma20 - (std20 * 2))) / ma20) * 100
+    return df
 
+# ==========================================
+# 3. LOGIKA BACKTESTING (STRATEGY ENGINE)
+# ==========================================
+def run_backtest(df):
+    initial_capital = 100_000_000
+    balance = initial_capital
+    position = 0
+    trades = []
+    
+    for i in range(len(df)):
+        price = df['Close'].iloc[i]
+        mfi = df['MFI'].iloc[i]
+        
+        # BUY: MFI < 20 (Oversold)
+        if position == 0 and mfi < 20:
+            position = balance / price
+            balance = 0
+            trades.append({'Date': df.index[i], 'Type': 'BUY', 'Price': price})
+            
+        # SELL: MFI > 80 (Overbought)
+        elif position > 0 and mfi > 80:
+            balance = position * price
+            position = 0
+            trades.append({'Date': df.index[i], 'Type': 'SELL', 'Price': price})
+
+    final_val = balance if position == 0 else position * df['Close'].iloc[-1]
+    return final_val, ((final_val - initial_capital)/initial_capital)*100, trades
+
+# ==========================================
+# 4. EKSEKUSI & VISUALISASI
+# ==========================================
+try:
+    # A. Download Data
+    data = yf.download(ticker, period=period_input, interval=timeframe)
+    
+    if not data.empty:
+        # B. Hitung Indikator
+        df = add_indicators(data)
+        
+        # C. Chart Utama (Plotly)
+        fig = make_subplots(rows=3, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=[0.6, 0.2, 0.2])
+        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"), row=1, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['MFI'], name="MFI", line=dict(color='yellow')), row=2, col=1)
+        fig.add_trace(go.Scatter(x=df.index, y=df['BBW'], name="BB Width", fill='tozeroy', line=dict(color='cyan')), row=3, col=1)
+        fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False)
+        st.plotly_chart(fig, use_container_width=True)
+        
+        # D. Tampilkan Hasil Backtest
+        st.header("📊 Backtest Result (MFI Strategy)")
+        final_val, profit, trade_log = run_backtest(df)
+        
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Final Balance", f"IDR {final_val:,.0f}")
+        c2.metric("Profit/Loss (%)", f"{profit:.2f}%")
+        c3.metric("Total Trades", len(trade_log))
+        
+        if trade_log:
+            with st.expander("Detail Transaksi"):
+                st.table(pd.DataFrame(trade_log))
     else:
-        try:
-            df = get_stock_data(ticker_input, period, interval)
-            if not df.empty:
-                # Plot Candlestick
-                fig = go.Figure(data=[go.Candlestick(
-                    x=df.index,
-                    open=df['Open'],
-                    high=df['High'],
-                    low=df['Low'],
-                    close=df['Close'],
-                    name=ticker_input
-                )])
-                fig.update_layout(height=600, template="plotly_dark", xaxis_rangeslider_visible=False)
-                st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    st.subheader("Statistik Saham")
-                    st.write(df.tail(10))
-            else:
-                st.warning("Data tidak ditemukan. Pastikan kode saham benar (misal: TLKM.JK).")
-        except Exception as e:
-            st.error(f"Error Saham: {e}")
+        st.warning("Data kosong. Periksa simbol/ticker.")
 
-st.sidebar.markdown("---")
-st.sidebar.write("Dashboard ini berjalan di browser dan bisa di-deploy ke Streamlit Cloud agar bisa diakses via HP.")
-
+except Exception as e:
+    st.error(f"Terjadi kesalahan: {e}")
