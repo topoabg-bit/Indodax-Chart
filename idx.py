@@ -8,167 +8,203 @@ import numpy as np
 # ==========================================
 # 1. KONFIGURASI HALAMAN
 # ==========================================
-st.set_page_config(page_title="Expert Trend Dashboard", layout="wide")
-st.title("📈 Trend Follower Pro: EMA Cross + Stop Loss")
+st.set_page_config(page_title="GainzAlgo-Style Pro Dashboard", layout="wide")
+st.title("🚀 GainzAlgo-Style Pro Suite (HMA + SuperTrend)")
 
 # --- SIDEBAR ---
-st.sidebar.header("1. Market & Aset")
-market_type = st.sidebar.radio("Market:", ["Crypto (-USD)", "Saham Indonesia (.JK)"])
+st.sidebar.header("1. Asset Configuration")
+market_type = st.sidebar.radio("Market Type:", ["Crypto (-USD)", "Saham Indo (.JK)"])
 
-if market_type == "Saham Indonesia (.JK)":
+if market_type == "Saham Indo (.JK)":
     default_ticker = "BBCA.JK"
-    period_opts = ["6mo", "1y", "2y", "5y"]
 else:
     default_ticker = "BTC-USD"
-    period_opts = ["3mo", "6mo", "1y", "2y"]
 
-ticker = st.sidebar.text_input("Simbol Aset:", value=default_ticker)
-timeframe = st.sidebar.selectbox("Timeframe:", ["1d", "1h"], index=0)
-period_input = st.sidebar.selectbox("Periode Backtest:", period_opts, index=1)
+ticker = st.sidebar.text_input("Ticker Symbol:", value=default_ticker)
+timeframe = st.sidebar.selectbox("Timeframe:", ["1d", "1h", "15m", "5m"], index=0)
+period_input = st.sidebar.selectbox("Backtest Data:", ["6mo", "1y", "2y"], index=1)
 
 st.sidebar.markdown("---")
-st.sidebar.header("2. Strategi Setup")
-fast_ma = st.sidebar.slider("EMA Cepat (Fast Trend)", 5, 50, 20)
-slow_ma = st.sidebar.slider("EMA Lambat (Baseline)", 20, 200, 50)
-stop_loss_pct = st.sidebar.slider("Stop Loss Protection (%)", 1, 20, 5) / 100
+st.sidebar.header("2. Algo Sensitivity")
+# Parameter HMA (Hull Moving Average)
+hma_len = st.sidebar.slider("HMA Length (Fast Signal)", 10, 100, 55)
+# Parameter SuperTrend
+atr_len = st.sidebar.slider("ATR Length (Volatility)", 7, 20, 10)
+factor = st.sidebar.slider("SuperTrend Factor (Multiplier)", 1.0, 5.0, 3.0, step=0.1)
 
 # ==========================================
-# 2. LOGIKA INDIKATOR (TREND FOLLOWING)
+# 2. MATHEMATICAL ENGINE (The "Secret Sauce")
 # ==========================================
-def add_trend_indicators(df, fast, slow):
-    # Exponential Moving Average (EMA) lebih responsif daripada MA biasa
-    df['EMA_Fast'] = df['Close'].ewm(span=fast, adjust=False).mean()
-    df['EMA_Slow'] = df['Close'].ewm(span=slow, adjust=False).mean()
+
+# A. Weighted Moving Average (Helper untuk HMA)
+def wma(series, length):
+    weights = np.arange(1, length + 1)
+    return series.rolling(length).apply(lambda x: np.dot(x, weights) / weights.sum(), raw=True)
+
+# B. Hull Moving Average (HMA) - "Zero Lag" Indicator
+def calculate_hma(series, length):
+    half_length = int(length / 2)
+    sqrt_length = int(np.sqrt(length))
     
-    # Signal: 1 jika Fast > Slow (Uptrend), -1 jika Fast < Slow (Downtrend)
-    df['Trend'] = np.where(df['EMA_Fast'] > df['EMA_Slow'], 1, -1)
+    wma_half = wma(series, half_length)
+    wma_full = wma(series, length)
+    
+    raw_hma = (2 * wma_half) - wma_full
+    return wma(raw_hma, sqrt_length)
+
+# C. SuperTrend Indicator
+def calculate_supertrend(df, atr_period, multiplier):
+    # Hitung True Range (TR)
+    hl2 = (df['High'] + df['Low']) / 2
+    df['TR'] = np.maximum(df['High'] - df['Low'], 
+                          np.maximum(abs(df['High'] - df['Close'].shift(1)), 
+                                     abs(df['Low'] - df['Close'].shift(1))))
+    df['ATR'] = df['TR'].rolling(atr_period).mean()
+    
+    # Basic Bands
+    df['Basic_Upper'] = hl2 + (multiplier * df['ATR'])
+    df['Basic_Lower'] = hl2 - (multiplier * df['ATR'])
+    
+    # Final Bands (Logic SuperTrend)
+    df['Final_Upper'] = 0.0
+    df['Final_Lower'] = 0.0
+    df['SuperTrend'] = 0.0
+    df['Trend_Dir'] = 1 # 1 = Up (Green), -1 = Down (Red)
+    
+    for i in range(atr_period, len(df)):
+        # Upper Band Logic
+        if df['Basic_Upper'].iloc[i] < df['Final_Upper'].iloc[i-1] or df['Close'].iloc[i-1] > df['Final_Upper'].iloc[i-1]:
+            df.loc[df.index[i], 'Final_Upper'] = df['Basic_Upper'].iloc[i]
+        else:
+            df.loc[df.index[i], 'Final_Upper'] = df['Final_Upper'].iloc[i-1]
+            
+        # Lower Band Logic
+        if df['Basic_Lower'].iloc[i] > df['Final_Lower'].iloc[i-1] or df['Close'].iloc[i-1] < df['Final_Lower'].iloc[i-1]:
+            df.loc[df.index[i], 'Final_Lower'] = df['Basic_Lower'].iloc[i]
+        else:
+            df.loc[df.index[i], 'Final_Lower'] = df['Final_Lower'].iloc[i-1]
+            
+        # Trend Direction Logic
+        prev_trend = df['Trend_Dir'].iloc[i-1]
+        
+        if prev_trend == 1: # Sedang Uptrend
+            if df['Close'].iloc[i] < df['Final_Lower'].iloc[i]:
+                df.loc[df.index[i], 'Trend_Dir'] = -1 # Ganti jadi Downtrend
+            else:
+                df.loc[df.index[i], 'Trend_Dir'] = 1
+        else: # Sedang Downtrend
+            if df['Close'].iloc[i] > df['Final_Upper'].iloc[i]:
+                df.loc[df.index[i], 'Trend_Dir'] = 1 # Ganti jadi Uptrend
+            else:
+                df.loc[df.index[i], 'Trend_Dir'] = -1
+                
+        # Nilai SuperTrend Final untuk Plotting
+        if df['Trend_Dir'].iloc[i] == 1:
+            df.loc[df.index[i], 'SuperTrend'] = df['Final_Lower'].iloc[i]
+        else:
+            df.loc[df.index[i], 'SuperTrend'] = df['Final_Upper'].iloc[i]
+            
     return df
 
 # ==========================================
-# 3. ENGINE BACKTEST (DENGAN STOP LOSS)
+# 3. STRATEGY BACKTESTER (CONFLUENCE LOGIC)
 # ==========================================
-def run_trend_backtest(df, sl_pct):
+def run_algo_backtest(df):
     capital = 100_000_000
     balance = capital
     position = 0
-    entry_price = 0
     trades = []
     
-    # Loop data
     for i in range(1, len(df)):
-        current_price = df['Close'].iloc[i]
-        current_date = df.index[i]
+        # Skip data awal yg belum ada indikatornya
+        if df['SuperTrend'].iloc[i] == 0: continue
         
-        # Cek Trend (EMA Cross)
-        prev_trend = df['Trend'].iloc[i-1]
-        curr_trend = df['Trend'].iloc[i]
+        close = df['Close'].iloc[i]
+        trend_dir = df['Trend_Dir'].iloc[i]      # 1 = Green, -1 = Red
+        hma_val = df['HMA'].iloc[i]
+        prev_hma = df['HMA'].iloc[i-1]
         
-        # --- LOGIKA JUAL (Exit) ---
-        if position > 0:
-            # 1. Kena Stop Loss? (Bahaya, potong rugi!)
-            if current_price <= entry_price * (1 - sl_pct):
-                reason = "🛑 STOP LOSS"
-                pnl_pct = (current_price - entry_price) / entry_price
-                balance = position * current_price
-                position = 0
-                trades.append({
-                    'Tanggal': current_date, 'Aksi': 'SELL', 'Alasan': reason,
-                    'Harga': current_price, 'PnL (%)': pnl_pct * 100, 'Saldo': balance
-                })
-                continue # Lanjut ke hari berikutnya
+        # HMA Slope (Kemiringan HMA)
+        hma_rising = hma_val > prev_hma
+        
+        # --- SIGNAL LOGIC (CONFLUENCE) ---
+        # BUY Signal: SuperTrend HIJAU (1) DAN Harga di atas HMA
+        buy_signal = (trend_dir == 1) and (close > hma_val)
+        
+        # SELL Signal: SuperTrend MERAH (-1) ATAU Harga jebol ke bawah HMA
+        sell_signal = (trend_dir == -1) or (close < hma_val)
+        
+        # Eksekusi
+        if position == 0 and buy_signal:
+            position = balance / close
+            balance = 0
+            trades.append({'Date': df.index[i], 'Type': 'BUY', 'Price': close, 'Reason': 'SuperTrend + HMA Confirmed'})
             
-            # 2. Trend Berubah jadi Turun (Death Cross)?
-            if prev_trend == 1 and curr_trend == -1:
-                reason = "📉 Trend Reversal"
-                pnl_pct = (current_price - entry_price) / entry_price
-                balance = position * current_price
-                position = 0
-                trades.append({
-                    'Tanggal': current_date, 'Aksi': 'SELL', 'Alasan': reason,
-                    'Harga': current_price, 'PnL (%)': pnl_pct * 100, 'Saldo': balance
-                })
+        elif position > 0 and sell_signal:
+            balance = position * close
+            pnl = (close - trades[-1]['Price']) / trades[-1]['Price']
+            position = 0
+            trades.append({'Date': df.index[i], 'Type': 'SELL', 'Price': close, 'Reason': 'Trend Broken', 'PnL': pnl*100})
 
-        # --- LOGIKA BELI (Entry) ---
-        # Beli jika Trend berubah dari Bawah ke Atas (Golden Cross) DAN tidak punya posisi
-        elif position == 0:
-            if prev_trend == -1 and curr_trend == 1:
-                position = balance / current_price
-                entry_price = current_price
-                balance = 0
-                trades.append({
-                    'Tanggal': current_date, 'Aksi': 'BUY', 'Alasan': '🚀 Golden Cross',
-                    'Harga': current_price, 'PnL (%)': 0, 'Saldo': position * current_price
-                })
-
-    # Valuasi Akhir
     final_val = balance if position == 0 else position * df['Close'].iloc[-1]
-    total_profit = ((final_val - capital) / capital) * 100
-    return final_val, total_profit, trades
+    return final_val, ((final_val - capital)/capital)*100, trades
 
 # ==========================================
-# 4. TAMPILAN DASHBOARD
+# 4. VISUALISASI & MAIN APP
 # ==========================================
 try:
-    # A. Fetch Data
     data = yf.download(ticker, period=period_input, interval=timeframe)
     if isinstance(data.columns, pd.MultiIndex):
         data.columns = data.columns.get_level_values(0)
     data = data.dropna()
 
-    if not data.empty and len(data) > slow_ma:
-        # B. Hitung
-        df = add_trend_indicators(data, fast_ma, slow_ma)
-        final_val, profit_pct, trade_log = run_trend_backtest(df, stop_loss_pct)
+    if not data.empty and len(data) > hma_len:
+        # --- Hitung Indikator ---
+        data['HMA'] = calculate_hma(data['Close'], hma_len)
+        data = calculate_supertrend(data, atr_len, factor)
         
-        # C. Scorecard Utama
-        st.subheader(f"Simulasi Strategy pada {ticker}")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Modal Awal", "IDR 100 Juta")
-        
-        delta_color = "normal" if profit_pct >= 0 else "inverse"
-        c2.metric("Total Profit/Loss", f"{profit_pct:.2f}%", delta=f"{profit_pct:.2f}%", delta_color=delta_color)
-        c3.metric("Saldo Akhir", f"IDR {final_val:,.0f}")
-
-        # D. Visualisasi Chart (Entry/Exit Marker)
+        # --- Visualisasi ---
         fig = go.Figure()
         
         # Candlestick
-        fig.add_trace(go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'], name="Price"))
+        fig.add_trace(go.Candlestick(x=data.index, open=data['Open'], high=data['High'], low=data['Low'], close=data['Close'], name="Price"))
         
-        # EMA Lines
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Fast'], line=dict(color='cyan', width=1), name=f"EMA {fast_ma}"))
-        fig.add_trace(go.Scatter(x=df.index, y=df['EMA_Slow'], line=dict(color='orange', width=2), name=f"EMA {slow_ma}"))
+        # Hull Moving Average (Garis Halus Cepat)
+        fig.add_trace(go.Scatter(x=data.index, y=data['HMA'], line=dict(color='purple', width=2), name=f"HMA ({hma_len})"))
+        
+        # SuperTrend (Garis Support/Resistance Dinamis)
+        # Kita warnai manual: Hijau saat Uptrend, Merah saat Downtrend
+        st_color = ['green' if t == 1 else 'red' for t in data['Trend_Dir']]
+        
+        # Trik Plotly untuk garis warna-warni (Segmented Line) agak rumit, kita pakai Scatter sederhana dengan marker
+        fig.add_trace(go.Scatter(x=data.index, y=data['SuperTrend'], mode='markers', marker=dict(size=2, color=st_color), name="SuperTrend Line"))
 
-        # Plot Buy/Sell Markers dari History
-        trades_df = pd.DataFrame(trade_log)
-        if not trades_df.empty:
-            buys = trades_df[trades_df['Aksi'] == 'BUY']
-            sells = trades_df[trades_df['Aksi'] == 'SELL']
-            
-            # Panah Hijau untuk BUY
-            fig.add_trace(go.Scatter(
-                x=buys['Tanggal'], y=buys['Harga'], mode='markers', 
-                marker=dict(symbol='triangle-up', size=15, color='green'), name="BUY Signal"
-            ))
-            
-            # Panah Merah untuk SELL
-            fig.add_trace(go.Scatter(
-                x=sells['Tanggal'], y=sells['Harga'], mode='markers', 
-                marker=dict(symbol='triangle-down', size=15, color='red'), name="SELL Signal"
-            ))
+        # --- Backtest ---
+        final_val, profit, log = run_algo_backtest(data)
+        
+        # Tampilkan Markers BUY/SELL
+        log_df = pd.DataFrame(log)
+        if not log_df.empty:
+            buys = log_df[log_df['Type'] == 'BUY']
+            sells = log_df[log_df['Type'] == 'SELL']
+            fig.add_trace(go.Scatter(x=buys['Date'], y=buys['Price'], mode='markers', marker=dict(symbol='triangle-up', size=12, color='lime'), name="ALGO BUY"))
+            fig.add_trace(go.Scatter(x=sells['Date'], y=sells['Price'], mode='markers', marker=dict(symbol='triangle-down', size=12, color='red'), name="ALGO SELL"))
 
-        fig.update_layout(height=700, template="plotly_dark", title=f"Chart & Trade Signals: {ticker}")
+        fig.update_layout(height=700, template="plotly_dark", title=f"GainzAlgo-Style Replicant: {ticker}")
         st.plotly_chart(fig, use_container_width=True)
-
-        # E. Jurnal Trading
-        with st.expander("📜 Lihat Detail Jurnal Transaksi (Kenapa saya rugi/untung?)"):
-            if not trades_df.empty:
-                st.dataframe(trades_df.style.format({"Harga": "{:.2f}", "PnL (%)": "{:.2f}", "Saldo": "{:,.0f}"}))
-            else:
-                st.write("Tidak ada sinyal trade pada periode ini.")
-                
+        
+        # --- Scorecard ---
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Algorithm Result (IDR)", f"{final_val:,.0f}")
+        c2.metric("Win/Loss %", f"{profit:.2f}%", delta=f"{profit:.2f}%")
+        c3.metric("Trades Executed", len(log))
+        
+        with st.expander("Show Trade Logs"):
+            if not log_df.empty:
+                st.dataframe(log_df.style.format({"Price": "{:.2f}", "PnL": "{:.2f}%"}))
     else:
-        st.error("Data tidak cukup untuk menghitung EMA. Coba perpanjang periode.")
+        st.warning("Data sedang dimuat atau tidak cukup untuk menghitung HMA.")
 
 except Exception as e:
     st.error(f"System Error: {e}")
